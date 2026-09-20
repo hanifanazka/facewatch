@@ -3,12 +3,12 @@
 
 mod align;
 mod aura;
-mod display;
 mod draw;
 mod elements;
 mod face;
 mod gallery;
 mod models;
+mod rtsp;
 mod scrfd;
 
 use std::path::PathBuf;
@@ -19,11 +19,11 @@ use clap::{Parser, Subcommand};
 use pupi::{GstreamRunner, GstreamRunnerError};
 
 use crate::aura::AuraFace;
-use crate::display::Viewer;
 use crate::elements::{Chain, OverlayOptions};
 use crate::face::Array3U8;
 use crate::gallery::{Gallery, load_gallery_any};
 use crate::models::{Models, ensure_models};
+use crate::rtsp::RtspPublisher;
 use crate::scrfd::Scrfd;
 
 /// Default gallery location: `$HOME/.facewatch/gallery.json`.
@@ -54,9 +54,13 @@ struct Cli {
     #[arg(long)]
     gallery: Option<PathBuf>,
 
-    /// Do not open a display window.
+    /// Publish the annotated stream to this RTSP URL (mediamtx).
+    #[arg(long, default_value = "rtsp://127.0.0.1:8554/facewatch")]
+    rtsp: String,
+
+    /// Do not publish to RTSP (process frames headlessly).
     #[arg(long)]
-    no_window: bool,
+    no_rtsp: bool,
 
     /// Save annotated frames to this directory.
     #[arg(long)]
@@ -223,19 +227,13 @@ fn run(
     elements::link_upstream(&runner, &chain.detection)?;
     elements::negotiate_upstream(&runner)?;
 
-    eprintln!(
-        "driving pipeline from GStreamer webcam source (press ESC in the window to stop)"
-    );
+    eprintln!("driving pipeline from GStreamer webcam source");
     if cli.save_dir.is_some() {
         eprintln!("saving annotated frames to {}", cli.save_dir.as_ref().unwrap().display());
     }
 
     runner.start_pipeline()?;
-    let mut viewer = if cli.no_window {
-        None
-    } else {
-        Some(Viewer::new("facewatch", 640, 480)?)
-    };
+    let mut publisher: Option<RtspPublisher> = None;
 
     let mut processed: u64 = 0;
     let result = loop {
@@ -247,17 +245,27 @@ fn run(
         }
         processed += 1;
 
-        if let Some(viewer) = viewer.as_mut() {
-            let mut latest = None;
-            while let Ok(frame) = chain.display_rx.try_recv() {
-                latest = Some(frame);
+        // Drain the annotated-frame channel (keeping the newest frame) and
+        // publish it over RTSP. The publisher is created lazily from the
+        // first frame's dimensions.
+        let mut latest = None;
+        while let Ok(frame) = chain.display_rx.try_recv() {
+            latest = Some(frame);
+        }
+        if let (Some(frame), false) = (&latest, cli.no_rtsp) {
+            let (h, w, _) = frame.dim();
+            if publisher.is_none() {
+                let mut p = RtspPublisher::new(&cli.rtsp, w as u32, h as u32)?;
+                p.start()?;
+                publisher = Some(p);
             }
-            if let Some(frame) = latest {
-                if !viewer.update(&frame)? {
-                    break Ok(()); // window closed
-                }
-            }
-        } else if !cli.verbose && processed % 90 == 1 {
+            publisher
+                .as_mut()
+                .expect("publisher was just created")
+                .push_frame(&frame)?;
+        }
+
+        if !cli.verbose && processed % 90 == 1 {
             eprintln!("{processed} frames processed");
         }
 
@@ -267,6 +275,9 @@ fn run(
             }
         }
     };
+    if let Some(p) = publisher.as_mut() {
+        p.stop();
+    }
     runner.stop().ok();
     result
 }
@@ -284,32 +295,6 @@ fn analyze_image(
 
     eprintln!("analyzing {} ({}x{})", path.display(), frame_w, frame_h);
     chain.push_frame(frame)?;
-
-    let mut viewer = if cli.no_window {
-        None
-    } else {
-        match Viewer::new("facewatch", frame_w, frame_h) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("warning: {e}");
-                None
-            }
-        }
-    };
-
-    if let Some(viewer) = viewer.as_mut() {
-        let mut latest = None;
-        while let Ok(f) = chain.display_rx.try_recv() {
-            latest = Some(f);
-        }
-        if let Some(frame) = latest {
-            if !viewer.update(&frame)? {
-                return Ok(());
-            }
-        }
-        eprintln!("showing result; close the window or press ESC to exit");
-        while viewer.pump()? {}
-    }
     Ok(())
 }
 

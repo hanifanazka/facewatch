@@ -2,15 +2,18 @@
 
 A webcam face-recognition binary that drives **pupi**'s push-pipeline
 end-to-end: live webcam frames flow through SCRFD detection, AuraFace
-recognition, gallery matching, and an annotated overlay — all through the
-standard `pupi::Element` / `SinkPad` / `SourcePad` plumbing.
+recognition, gallery matching, and an annotated overlay — which is then
+published over RTSP to a **mediamtx** server for any client to watch.
 
 ```
-webcam (GStreamer) ──► DetectionElement ──► RecognitionElement ──► MatchElement ──► OverlaySink
-       RGB frame         SCRFD faces         112×112 crops → 512-d      cosine vs gallery     boxes/labels/FPS,
-                       (Array3<u8>→FaceFrame) L2-normalized embeddings   → FaceMatches       save frames, display
-                                                                        (threshold 0.40)
+webcam (GStreamer) ──► Detection ──► Recognition ──► Matching ──► OverlaySink ──► appsrc
+       RGB frame         SCRFD        112×112 → 512-d   cosine vs   boxes/labels │ x264enc (ultrafast,
+                                                         gallery     fps, verbose  │ zerolatency, 2000 kbps)
+                                                                   ┌──────────────┘
+                                                                   ▼
+                                                             rtspclientsink ──► mediamtx :8554 (tcp)
 ```
+
 
 ## Setup
 
@@ -74,9 +77,13 @@ Global flags come **before** the subcommand:
 # Register a face under a name (from a photo, or one webcam snapshot if no image given)
 facewatch --models-dir models register alice photo.jpg
 
-# Live webcam recognition (ESC in the window exits; --frames N stops after N frames)
+# Live webcam recognition, published to mediamtx (--frames N stops after N frames)
 facewatch --models-dir models run
-facewatch --models-dir models run --no-window --frames 20 --verbose
+facewatch --models-dir models run --frames 20 --verbose
+
+# Publish to a different endpoint, or process headlessly without streaming
+facewatch --models-dir models run --rtsp rtsp://127.0.0.1:8554/cam1
+facewatch --models-dir models run --no-rtsp
 
 # Analyze a single still image through the same chain
 facewatch --models-dir models image photo.jpg
@@ -89,10 +96,63 @@ facewatch --models-dir models image photo.jpg
 | `--models-dir DIR` | `models` | Directory that contains (or will receive) the ONNX models |
 | `--threshold F` | `0.40` | Minimum cosine similarity for a gallery match |
 | `--gallery PATH` | `~/.facewatch/gallery.json` | Gallery JSON path |
-| `--no-window` | off | Do not open the display window (headless) |
+| `--rtsp URL` | `rtsp://127.0.0.1:8554/facewatch` | Publish the annotated stream to this RTSP URL |
+| `--no-rtsp` | off | Do not publish to RTSP (headless processing) |
 | `--save-dir DIR` | — | Save annotated frames (`frame_000001.png`, …) |
 | `--save-every N` | `1` | Save every Nth annotated frame |
 | `--verbose` | off | Print one JSON line per processed frame (boxes, kps, matches) |
+
+## Streaming with mediamtx
+
+`facewatch run` encodes the annotated frames (via the exact pipeline
+`appsrc ! videoconvert ! video/x-raw,format=I420 ! x264enc speed-preset=ultrafast tune=zerolatency bitrate=2000 cabac=false dct8x8=false key-int-max=1 ! rtspclientsink protocols=tcp`) and
+publishes them to the `--rtsp` URL — by default `rtsp://127.0.0.1:8554/facewatch`.
+
+The extra `x264enc` flags are for decoder compatibility on openSUSE builds,
+where `libopenh264` is the *only* H.264 decoder (ffmpeg ships without the
+native h264 decoder there):
+
+- `cabac=false dct8x8=false` — OpenH264 can't decode High/Main; with these off
+  (plus zerolatency's `bframes=0`) x264 emits a Baseline stream it accepts.
+- `key-int-max=1` — every frame is an IDR, so clients joining mid-stream
+  (between keyframes) start decoding on the first frame instead of erroring on
+  a GOP of P-slices until the next keyframe.
+
+1. **Install the GStreamer plugins** (openSUSE Leap 16):
+
+   ```sh
+   sudo zypper install gstreamer-rtsp-server-devel      # rtspclientsink (OSS)
+   sudo zypper addrepo --refresh https://ftp.gwdg.de/pub/linux/misc/packman/suse/openSUSE_Leap_16.0/ packman
+   sudo zypper --gpg-auto-import-keys refresh
+   sudo zypper install gstreamer-plugins-ugly-codecs    # x264enc + libx264 (Packman)
+   gst-inspect-1.0 x264enc && gst-inspect-1.0 rtspclientsink   # verify
+   ```
+
+   > Packman's `x264enc` lives in the `gstreamer-plugins-ugly-codecs`
+   > subpackage, not the OSS-repo `gstreamer-plugins-ugly`.
+   > Note that the openSUSE OSS `gstreamer-plugins-ugly` has no x264.
+
+2. **Run mediamtx** (binary and config kept in `vendor/mediamtx/` — pass the config
+   explicitly, otherwise it looks for `mediamtx.yml` in the current directory):
+
+   ```sh
+   ./vendor/mediamtx/mediamtx ./vendor/mediamtx/mediamtx.yml
+   ```
+
+3. **Run facewatch** in another terminal:
+
+   ```sh
+   cargo run --release -- run
+   ```
+
+4. **Watch it** with `mpv` (low-latency profile, as configured):
+
+   ```sh
+   mpv --profile=low-latency rtsp://127.0.0.1:8554/facewatch
+   ```
+
+   While publishing, the stream is listed in mediamtx's API at
+   `http://127.0.0.1:9997/v3/paths/get/facewatch`.
 
 ## Pipeline details
 

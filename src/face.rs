@@ -95,11 +95,6 @@ impl Rgb {
     pub fn new(r: u8, g: u8, b: u8) -> Self {
         Rgb([r, g, b])
     }
-
-    pub fn rgba32(self) -> u32 {
-        let [r, g, b] = self.0;
-        (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-    }
 }
 
 impl From<[u8; 3]> for Rgb {
@@ -118,15 +113,6 @@ impl Rgb {
     pub fn array(self) -> [u8; 3] {
         self.0
     }
-}
-
-/// Converts an `Array3<u8>` frame to a u32 RGBA8888 buffer for display.
-pub fn arr3_to_rgba32(frame: &Array3U8) -> Vec<u32> {
-    let bytes = frame.as_slice().expect("frame is contiguous");
-    bytes
-        .chunks_exact(3)
-        .map(|pix| (u32::from(pix[0]) << 16) | (u32::from(pix[1]) << 8) | u32::from(pix[2]))
-        .collect()
 }
 
 /// Resizes a frame to `(new_width, new_height)` using bilinear filtering and

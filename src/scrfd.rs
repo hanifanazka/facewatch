@@ -60,16 +60,20 @@ impl Scrfd {
         let src_h = frame.shape()[0];
         let src_w = frame.shape()[1];
 
-        // Letterbox resize: fit the src aspect ratio inside 640x640, top-left.
+        // Letterbox resize: fit the src aspect ratio inside 640x640, top-left
+        // (matches insightface's scrfd.py). Taller-than-wide sources fix the
+        // height; wider sources fix the width.
         let im_ratio = src_h as f32 / src_w as f32;
         // model_ratio = 640/640 = 1.0; when the image is taller than wide we
         // fix the height, otherwise we fix the width.
         let (new_w, new_h) = if im_ratio > 1.0 {
-            (INPUT_SIZE, (INPUT_SIZE as f32 / im_ratio).floor().max(1.0) as usize)
+            ((INPUT_SIZE as f32 / im_ratio).floor().max(1.0) as usize, INPUT_SIZE)
         } else {
-            ((INPUT_SIZE as f32 * im_ratio).floor().max(1.0) as usize, INPUT_SIZE)
+            (INPUT_SIZE, (INPUT_SIZE as f32 * im_ratio).floor().max(1.0) as usize)
         };
-        let det_scale = new_h as f32 / src_h as f32;
+        // Per-axis scales so x/y map back independently of letterbox padding.
+        let scale_x = new_w as f32 / src_w as f32;
+        let scale_y = new_h as f32 / src_h as f32;
 
         let resized = resize_frame(frame, new_w, new_h);
 
@@ -143,18 +147,18 @@ impl Scrfd {
             scores_all
         };
 
-        // Map back to source coordinates.
+        // Map back to source coordinates (per-axis scales).
         let mut scores_all = scores_all;
         for det in &mut scores_all {
             det.1 = [
-                det.1[0] / det_scale,
-                det.1[1] / det_scale,
-                det.1[2] / det_scale,
-                det.1[3] / det_scale,
+                det.1[0] / scale_x,
+                det.1[1] / scale_y,
+                det.1[2] / scale_x,
+                det.1[3] / scale_y,
             ];
             for k in det.2.iter_mut() {
-                k[0] /= det_scale;
-                k[1] /= det_scale;
+                k[0] /= scale_x;
+                k[1] /= scale_y;
             }
         }
 
