@@ -393,7 +393,7 @@ fn draw_face(
 
     let label = match matched {
         Some(m) => format!("{} {:.2}", m.name, m.score),
-        None => format!("? {:.2}", face.score),
+        None => format!("Face unknown {:.2}", face.score),
     };
     let tw = draw::text_width(&label) as i32;
     let label_y = (y1 - 12).max(4);

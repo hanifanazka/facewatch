@@ -194,8 +194,8 @@ pub fn draw_text(img: &mut RgbImage, x: i32, y: i32, text: &str, c: FaceRgb) {
         for col in 0..5 {
             let column = glyph[col];
             for row in 0..7 {
-                // Bit 6 is the top row of the glyph.
-                if (column >> (6 - row)) & 1 == 1 {
+                // Bit 0 is the top row of the glyph.
+                if (column >> row) & 1 == 1 {
                     set_pixel(img, ox + col as i32, y + row as i32, color(c));
                 }
             }
