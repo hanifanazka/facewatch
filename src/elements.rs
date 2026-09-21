@@ -2,6 +2,7 @@
 //! terminal sink that draws results, saves annotated frames, and streams them
 //! to the display channel.
 
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -13,8 +14,7 @@ use crate::align;
 use crate::aura::AuraFace;
 use crate::draw;
 use crate::face::{
-    Array3U8, DetectedFace, FaceEmbeddings, FaceFrame, FaceMatches, Rgb, rgb_to_arr3_ref,
-    arr3_to_rgb,
+    Array3U8, DetectedFace, FaceEmbeddings, FaceFrame, FaceMatches, Rgb, arr3_to_rgb, rgb_to_arr3,
 };
 use crate::gallery::Gallery;
 use crate::scrfd::Scrfd;
@@ -45,16 +45,47 @@ fn make_pads<I: 'static, O: 'static>(
     (sink, src)
 }
 
-/// Stage 1: `Array3<u8>` RGB frame -> `FaceFrame` (detections).
-pub struct DetectionElement {
+/// A one-sink/one-source pipeline stage: the sink pad accepts `I`, the source
+/// pad offers `O`, and a synchronous transform turns each input buffer into
+/// the stage's output.
+pub struct Stage<I: 'static, O: 'static> {
     sink: Arc<Mutex<SinkPad>>,
     src: Arc<Mutex<SourcePad>>,
+    _marker: PhantomData<(I, O)>,
 }
 
-impl DetectionElement {
+impl<I: 'static, O: 'static> Stage<I, O> {
+    /// Builds a stage whose source pad offers `O`, driven by a synchronous
+    /// transform from each `I` input buffer. The concrete pipeline stages
+    /// wrap this in their named `new` constructors below.
+    pub fn from_transform(
+        transform: impl FnMut(&Buffer) -> Result<Buffer, String> + Send + 'static,
+    ) -> Self {
+        let (sink, src) = make_pads::<I, O>(transform);
+        Self {
+            sink,
+            src,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<I: 'static, O: 'static> Element for Stage<I, O> {
+    fn src_pad(&self, name: &str) -> Option<&Arc<Mutex<SourcePad>>> {
+        (name == "src").then_some(&self.src)
+    }
+    fn sink_pad(&self, name: &str) -> Option<&Arc<Mutex<SinkPad>>> {
+        (name == "sink").then_some(&self.sink)
+    }
+}
+
+/// Stage 1: `Array3<u8>` RGB frame -> `FaceFrame` (detections).
+pub type DetectionElement = Stage<Array3U8, FaceFrame>;
+
+impl Stage<Array3U8, FaceFrame> {
     pub fn new(detector: Scrfd) -> Self {
         let mut detector = detector;
-        let (sink, src) = make_pads::<Array3U8, FaceFrame>(move |buffer| {
+        Stage::from_transform(move |buffer| {
             let frame = buffer
                 .downcast_ref::<Array3U8>()
                 .ok_or("expected Array3<u8> frame")?
@@ -64,30 +95,17 @@ impl DetectionElement {
                 src: Arc::new(frame),
                 faces,
             }))
-        });
-        Self { sink, src }
-    }
-}
-
-impl Element for DetectionElement {
-    fn src_pad(&self, name: &str) -> Option<&Arc<Mutex<SourcePad>>> {
-        (name == "src").then_some(&self.src)
-    }
-    fn sink_pad(&self, name: &str) -> Option<&Arc<Mutex<SinkPad>>> {
-        (name == "sink").then_some(&self.sink)
+        })
     }
 }
 
 /// Stage 2: `FaceFrame` -> `FaceEmbeddings` (aligned crops embedded).
-pub struct RecognitionElement {
-    sink: Arc<Mutex<SinkPad>>,
-    src: Arc<Mutex<SourcePad>>,
-}
+pub type RecognitionElement = Stage<FaceFrame, FaceEmbeddings>;
 
-impl RecognitionElement {
+impl Stage<FaceFrame, FaceEmbeddings> {
     pub fn new(aura: AuraFace) -> Self {
         let mut aura = aura;
-        let (sink, src) = make_pads::<FaceFrame, FaceEmbeddings>(move |buffer| {
+        Stage::from_transform(move |buffer| {
             let frame = buffer
                 .downcast_ref::<FaceFrame>()
                 .ok_or("expected FaceFrame")?
@@ -103,29 +121,16 @@ impl RecognitionElement {
                 faces: frame.faces.clone(),
                 embeddings,
             }))
-        });
-        Self { sink, src }
-    }
-}
-
-impl Element for RecognitionElement {
-    fn src_pad(&self, name: &str) -> Option<&Arc<Mutex<SourcePad>>> {
-        (name == "src").then_some(&self.src)
-    }
-    fn sink_pad(&self, name: &str) -> Option<&Arc<Mutex<SinkPad>>> {
-        (name == "sink").then_some(&self.sink)
+        })
     }
 }
 
 /// Stage 3: `FaceEmbeddings` -> `FaceMatches` (cosine similarity vs gallery).
-pub struct MatchElement {
-    sink: Arc<Mutex<SinkPad>>,
-    src: Arc<Mutex<SourcePad>>,
-}
+pub type MatchElement = Stage<FaceEmbeddings, FaceMatches>;
 
-impl MatchElement {
+impl Stage<FaceEmbeddings, FaceMatches> {
     pub fn new(gallery: Arc<Mutex<Gallery>>, threshold: f32) -> Self {
-        let (sink, src) = make_pads::<FaceEmbeddings, FaceMatches>(move |buffer| {
+        Stage::from_transform(move |buffer| {
             let faces = buffer
                 .downcast_ref::<FaceEmbeddings>()
                 .ok_or("expected FaceEmbeddings")?
@@ -139,17 +144,7 @@ impl MatchElement {
                 faces: faces.faces.clone(),
                 matches,
             }))
-        });
-        Self { sink, src }
-    }
-}
-
-impl Element for MatchElement {
-    fn src_pad(&self, name: &str) -> Option<&Arc<Mutex<SourcePad>>> {
-        (name == "src").then_some(&self.src)
-    }
-    fn sink_pad(&self, name: &str) -> Option<&Arc<Mutex<SinkPad>>> {
-        (name == "sink").then_some(&self.sink)
+        })
     }
 }
 
@@ -166,31 +161,19 @@ pub struct OverlayOptions {
 
 /// Stage 4 (terminal): draws boxes/labels on the frame, optionally saves and
 /// forwards it. Has only a sink pad.
-pub struct OverlaySink {
-    sink: Arc<Mutex<SinkPad>>,
-    _src: Arc<Mutex<SourcePad>>,
-}
+pub type OverlaySink = Stage<FaceMatches, ()>;
 
-impl OverlaySink {
+impl Stage<FaceMatches, ()> {
     pub fn new(options: OverlayOptions, display_tx: Option<Sender<Array3U8>>) -> Self {
-        let (sink, src) = make_pads::<FaceMatches, ()>(move |buffer| {
+        let mut state = OverlayState::default();
+        Stage::from_transform(move |buffer| {
             let matches = buffer
                 .downcast_ref::<FaceMatches>()
                 .ok_or("expected FaceMatches")?
                 .clone();
-            render_overlay(&matches, &options, &display_tx);
+            render_overlay(&matches, &options, &display_tx, &mut state);
             Ok(Buffer::new(()))
-        });
-        Self { sink, _src: src }
-    }
-}
-
-impl Element for OverlaySink {
-    fn src_pad(&self, name: &str) -> Option<&Arc<Mutex<SourcePad>>> {
-        (name == "src").then_some(&self._src)
-    }
-    fn sink_pad(&self, name: &str) -> Option<&Arc<Mutex<SinkPad>>> {
-        (name == "sink").then_some(&self.sink)
+        })
     }
 }
 
@@ -301,8 +284,12 @@ impl Default for OverlayState {
     }
 }
 
-fn render_overlay(matches: &FaceMatches, options: &OverlayOptions, display_tx: &Option<Sender<Array3U8>>) {
-    let mut state = overlay_state();
+fn render_overlay(
+    matches: &FaceMatches,
+    options: &OverlayOptions,
+    display_tx: &Option<Sender<Array3U8>>,
+    state: &mut OverlayState,
+) {
     state.frame_no += 1;
 
     // Frame-rate estimation over a sliding second.
@@ -371,7 +358,7 @@ fn render_overlay(matches: &FaceMatches, options: &OverlayOptions, display_tx: &
 
     // Stream to the display.
     if let Some(tx) = display_tx {
-        let _ = tx.send(rgb_to_arr3_ref(&img));
+        let _ = tx.send(rgb_to_arr3(&img));
     }
 }
 
@@ -399,15 +386,4 @@ fn draw_face(
     let label_y = (y1 - 12).max(4);
     draw::fill_rect(img, x1, label_y, (x1 + tw + 3).min(w - 1), (label_y + 10).min(h - 1), Rgb::BLACK);
     draw::draw_text(img, x1 + 1, label_y + 1, &label, Rgb::WHITE);
-}
-
-/// Per-process overlay state shared between (synchronous) pipeline frames.
-static OVERLAY_STATE: std::sync::OnceLock<std::sync::Mutex<OverlayState>> =
-    std::sync::OnceLock::new();
-
-fn overlay_state() -> std::sync::MutexGuard<'static, OverlayState> {
-    OVERLAY_STATE
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

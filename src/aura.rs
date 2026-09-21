@@ -9,7 +9,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, Embedding};
+use crate::face::{Array3U8, Embedding, fill_nchw};
 
 /// Input patch size for AuraFace (square 112x112).
 pub const INPUT_SIZE: usize = 112;
@@ -61,14 +61,7 @@ impl AuraFace {
         );
 
         let mut blob = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
-        for y in 0..INPUT_SIZE {
-            for x in 0..INPUT_SIZE {
-                for c in 0..3 {
-                    let v = crop[[y, x, c]] as f32;
-                    blob[[0, c, y, x]] = (v - 127.5) / 127.5;
-                }
-            }
-        }
+        fill_nchw(crop, 127.5, &mut blob);
 
         let tensor = Tensor::from_array(blob)?;
         let outputs = self.session.run(ort::inputs![self.input_name.as_str() => tensor])?;

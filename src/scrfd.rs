@@ -7,7 +7,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, DetectedFace, Kps, resize_frame};
+use crate::face::{Array3U8, DetectedFace, Kps, fill_nchw, resize_frame};
 
 /// SCRFD input resolution (width, height).
 pub const INPUT_SIZE: usize = 640;
@@ -77,22 +77,13 @@ impl Scrfd {
 
         // Build the NCHW float blob: (x - 127.5) / 128.0, RGB already.
         let mut blob = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
-        for y in 0..new_h {
-            for x in 0..new_w {
-                let p = resized[[y, x, 0]];
-                let g = resized[[y, x, 1]];
-                let b = resized[[y, x, 2]];
-                blob[[0, 0, y, x]] = (p as f32 - 127.5) / 128.0;
-                blob[[0, 1, y, x]] = (g as f32 - 127.5) / 128.0;
-                blob[[0, 2, y, x]] = (b as f32 - 127.5) / 128.0;
-            }
-        }
+        fill_nchw(&resized, 128.0, &mut blob);
 
         let tensor = Tensor::from_array(blob)?;
 
         // Run + decode inside a scope: `outputs` borrows `self.session`
         // mutably, so it must be dropped before we call `self.nms` below.
-        let scores_all = {
+        let mut scores_all = {
             let outputs = self.session.run(ort::inputs![self.input_name.as_str() => tensor])?;
 
             // Decode.
@@ -146,7 +137,6 @@ impl Scrfd {
         };
 
         // Map back to source coordinates (per-axis scales).
-        let mut scores_all = scores_all;
         for det in &mut scores_all {
             det.1 = [
                 det.1[0] / scale_x,

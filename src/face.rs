@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use image::RgbImage;
+use ndarray::Array4;
 
 /// Five 2D landmark points: left eye, right eye, nose, left mouth, right mouth.
 pub type Kps = [[f32; 2]; 5];
@@ -66,16 +67,11 @@ pub fn arr3_to_rgb(frame: &Array3U8) -> Option<RgbImage> {
     RgbImage::from_raw(width as u32, height as u32, frame.as_slice()?.to_vec())
 }
 
-/// Converts an `RgbImage` back to an `Array3<u8>` frame.
-pub fn rgb_to_arr3(img: RgbImage) -> Array3U8 {
+/// Converts an `RgbImage` to an `Array3<u8>` frame.
+pub fn rgb_to_arr3(img: &RgbImage) -> Array3U8 {
     let (width, height) = img.dimensions();
-    Array3U8::from_shape_vec((height as usize, width as usize, 3), img.into_raw())
+    Array3U8::from_shape_vec((height as usize, width as usize, 3), img.as_raw().to_vec())
         .expect("RGB image buffer is always exactly width*height*3 bytes")
-}
-
-/// Copies an `RgbImage` into an `Array3<u8>` frame.
-pub fn rgb_to_arr3_ref(img: &RgbImage) -> Array3U8 {
-    rgb_to_arr3(img.clone())
 }
 
 /// A color used when drawing overlays.
@@ -85,33 +81,26 @@ pub struct Rgb([u8; 3]);
 impl Rgb {
     pub const RED: Rgb = Rgb([255, 64, 64]);
     pub const GREEN: Rgb = Rgb([64, 255, 64]);
-    pub const BLUE: Rgb = Rgb([64, 64, 255]);
-    pub const YELLOW: Rgb = Rgb([255, 224, 64]);
-    pub const CYAN: Rgb = Rgb([64, 224, 255]);
     pub const WHITE: Rgb = Rgb([255, 255, 255]);
     pub const BLACK: Rgb = Rgb([0, 0, 0]);
-    pub const ORANGE: Rgb = Rgb([255, 160, 32]);
 
-    pub fn new(r: u8, g: u8, b: u8) -> Self {
-        Rgb([r, g, b])
-    }
-}
-
-impl From<[u8; 3]> for Rgb {
-    fn from(value: [u8; 3]) -> Self {
-        Rgb(value)
-    }
-}
-
-impl From<Rgb> for [u8; 3] {
-    fn from(value: Rgb) -> Self {
-        value.0
-    }
-}
-
-impl Rgb {
     pub fn array(self) -> [u8; 3] {
         self.0
+    }
+}
+
+/// Copies an RGB frame into the top-left of a zero-initialized `NCHW` float
+/// blob, normalizing pixels as `(pixel - 127.5) / denom`. `out` must be
+/// `(1, 3, H, W)`; the frame is written at the top-left and the rest stays
+/// zero, which is what both ONNX models expect as their input.
+pub fn fill_nchw(frame: &Array3U8, denom: f32, out: &mut Array4<f32>) {
+    let (height, width) = (frame.shape()[0], frame.shape()[1]);
+    for y in 0..height {
+        for x in 0..width {
+            out[[0, 0, y, x]] = (frame[[y, x, 0]] as f32 - 127.5) / denom;
+            out[[0, 1, y, x]] = (frame[[y, x, 1]] as f32 - 127.5) / denom;
+            out[[0, 2, y, x]] = (frame[[y, x, 2]] as f32 - 127.5) / denom;
+        }
     }
 }
 
@@ -125,5 +114,5 @@ pub fn resize_frame(frame: &Array3U8, new_width: usize, new_height: usize) -> Ar
         new_height as u32,
         image::imageops::FilterType::Triangle,
     );
-    rgb_to_arr3_ref(&resized)
+    rgb_to_arr3(&resized)
 }

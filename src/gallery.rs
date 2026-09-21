@@ -104,7 +104,7 @@ impl Gallery {
         } else {
             self.entries
                 .iter()
-                .map(|e| e.name.clone())
+                .map(|e| e.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -119,15 +119,13 @@ pub fn load_gallery_any(path: &Path) -> Result<Gallery> {
     }
     match Gallery::load(path) {
         Ok(g) => Ok(g),
-        Err(first) => {
+        Err(_) => {
             // Try legacy `{"name": [embedding...]}` map format.
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read gallery {}", path.display()))?;
-            let map: HashMap<String, Vec<f32>> =
-                serde_json::from_str(&raw).with_context(|| {
-                    format!("gallery {} is neither list nor map format", path.display())
-                })?;
-            let _ = first;
+            let map: HashMap<String, Vec<f32>> = serde_json::from_str(&raw).with_context(|| {
+                format!("gallery {} is neither list nor map format", path.display())
+            })?;
             Ok(Gallery {
                 entries: map
                     .into_iter()
