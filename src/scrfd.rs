@@ -1,8 +1,6 @@
 //! SCRFD face detector, decoding mirrored from insightface's `scrfd.py`
 //! (2 anchors per cell, strides 8/16/32, top-left zero-padded letterbox).
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use ndarray::{Array4, IxDyn};
 use ort::session::builder::GraphOptimizationLevel;
@@ -30,8 +28,8 @@ pub struct Scrfd {
 }
 
 impl Scrfd {
-    /// Loads a SCRFD ONNX model.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Builds a detection session from the embedded model bytes.
+    pub fn load(model_bytes: &[u8]) -> Result<Self> {
         // See aura.rs: ort's SessionBuilder returns `Error<SessionBuilder>`,
         // which is not `Send + Sync`, so stringify those errors explicitly.
         let mut builder = Session::builder()?
@@ -40,7 +38,7 @@ impl Scrfd {
             .with_intra_threads(2)
             .map_err(|e| anyhow::anyhow!("ort: {e}"))?;
         let session = builder
-            .commit_from_file(path)
+            .commit_from_memory(model_bytes)
             .context("failed to load SCRFD model")?;
 
         anyhow::ensure!(session.inputs().len() == 1, "SCRFD model must have exactly one input");

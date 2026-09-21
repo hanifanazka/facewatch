@@ -33,9 +33,16 @@ cargo build --release
 
 ### Models
 
-Two ONNX models are needed; they are downloaded automatically on first run
-from `https://huggingface.co/fal/AuraFace-v1`, or drop them into `models/`
-manually.
+Two ONNX models are **downloaded and SHA-256 verified at build time** and then
+**embedded into the binary**: `build.rs` ensures `scrfd_10g_bnkps.onnx` and
+`glintr100.onnx` exist in `models/` (fetching them from
+`https://huggingface.co/fal/AuraFace-v1` when absent, and checking every file
+against the exact hash fal publishes before the crate compiles), and
+`src/models.rs` packages the verified files with `include_bytes!`. The app
+performs no downloads or checksum logic at runtime.
+
+The models directory defaults to `models/` next to `Cargo.toml`; override it
+with `FACEWATCH_MODELS_DIR=/path` when building.
 
 > **Why AuraFace (commercial licensing).** Recognition is done by AuraFace
 > (`glintr100.onnx`), a ResNet100 + ArcFace-loss model published under an
@@ -60,9 +67,11 @@ manually.
 | `scrfd_10g_bnkps.onnx` (~16 MiB) | `[1,3,640,640]` f32, `(x-127.5)/128`, RGB | 9× rank-2 `[count,…]` (score/bbox/kps, strides 8/16/32) |
 | `glintr100.onnx` (~248 MiB) | `[1,3,112,112]` f32, `(x-127.5)/127.5` (no baked-in Sub/Mul) | `[1,512]` |
 
-**Model integrity.** Every local model file is verified against the exact
-SHA-256 fal publishes (HF LFS blob IDs) before use; a missing, truncated, or
-tampered file is re-downloaded and re-verified:
+**Model integrity.** `build.rs` verifies every model file against the exact
+SHA-256 fal publishes (HF LFS blob IDs) before embedding; a missing,
+truncated, or tampered file abort the download-and-verify step *at build
+time*, so the bytes packaged in the binary are always the published
+artifacts:
 
 ```
 scrfd_10g_bnkps.onnx  5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91
@@ -75,25 +84,24 @@ Global flags come **before** the subcommand:
 
 ```sh
 # Register a face under a name (from a photo, or one webcam snapshot if no image given)
-facewatch --models-dir models register alice photo.jpg
+facewatch register alice photo.jpg
 
 # Live webcam recognition, published to mediamtx (--frames N stops after N frames)
-facewatch --models-dir models run
-facewatch --models-dir models run --frames 20 --verbose
+facewatch run
+facewatch run --frames 20 --verbose
 
 # Publish to a different endpoint, or process headlessly without streaming
-facewatch --models-dir models run --rtsp rtsp://127.0.0.1:8554/cam1
-facewatch --models-dir models run --no-rtsp
+facewatch run --rtsp rtsp://127.0.0.1:8554/cam1
+facewatch run --no-rtsp
 
 # Analyze a single still image through the same chain
-facewatch --models-dir models image photo.jpg
+facewatch image photo.jpg
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--models-dir DIR` | `models` | Directory that contains (or will receive) the ONNX models |
 | `--threshold F` | `0.40` | Minimum cosine similarity for a gallery match |
 | `--gallery PATH` | `~/.facewatch/gallery.json` | Gallery JSON path |
 | `--rtsp URL` | `rtsp://127.0.0.1:8554/facewatch` | Publish the annotated stream to this RTSP URL |

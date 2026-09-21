@@ -219,8 +219,8 @@ impl Chain {
         threshold: f32,
         options: OverlayOptions,
     ) -> Result<Self> {
-        let detector = Scrfd::load(&models.scrfd)?;
-        let aura = AuraFace::load(&models.auraface)?;
+        let detector = Scrfd::load(models.scrfd)?;
+        let aura = AuraFace::load(models.auraface)?;
         let (tx, display_rx) = std::sync::mpsc::channel::<Array3U8>();
 
         let detection = DetectionElement::new(detector);

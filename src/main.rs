@@ -22,7 +22,7 @@ use crate::aura::AuraFace;
 use crate::elements::{Chain, OverlayOptions};
 use crate::face::Array3U8;
 use crate::gallery::{Gallery, load_gallery_any};
-use crate::models::{Models, ensure_models};
+use crate::models::Models;
 use crate::rtsp::RtspPublisher;
 use crate::scrfd::Scrfd;
 
@@ -42,10 +42,6 @@ fn default_gallery() -> PathBuf {
     about = "Webcam face recognition on the pupi push-pipeline (SCRFD + AuraFace, ONNX Runtime)."
 )]
 struct Cli {
-    /// Directory that contains (or will receive) the ONNX models.
-    #[arg(long, default_value = "models")]
-    models_dir: PathBuf,
-
     /// Minimum cosine similarity required for a gallery match.
     #[arg(long, default_value_t = 0.40)]
     threshold: f32,
@@ -103,7 +99,9 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let models = ensure_models(&cli.models_dir)?;
+    // The ONNX models are embedded in the binary by build.rs (verified via
+    // SHA-256 at compile time), so there is no runtime download or lookup.
+    let models = Models::embedded();
     let gallery_path = cli.gallery.clone().unwrap_or_else(default_gallery);
     let gallery = Arc::new(Mutex::new(load_gallery_any(&gallery_path)?));
 
@@ -174,8 +172,8 @@ fn register(
         anyhow::bail!("registration name must not be empty");
     }
 
-    let mut detector = Scrfd::load(&models.scrfd)?;
-    let mut aura = AuraFace::load(&models.auraface)?;
+    let mut detector = Scrfd::load(models.scrfd)?;
+    let mut aura = AuraFace::load(models.auraface)?;
 
     let frame = match image {
         Some(path) => load_image_frame(path)?,
