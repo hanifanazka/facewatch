@@ -168,6 +168,11 @@ native h264 decoder there):
 
 ## Pipeline details
 
+Frame acquisition keeps **only the newest frame**: the source appsink runs with
+`max-buffers=1, drop=true, sync=false`, so when detection/recognition fall
+behind the camera, older frames are discarded at the source and the pipeline
+always processes the freshest frame instead of a growing stale backlog.
+
 Frames from GStreamer are forced to `RGB` via a `capsfilter` on the appsink, so
 no channel swapping happens anywhere in the app. All preprocessing mirrors the
 insightface reference implementations:

@@ -20,7 +20,6 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use gstreamer::prelude::*;
 use pupi::{GstreamRunner, GstreamRunnerError};
 
 use crate::aura::AuraFace;
@@ -292,9 +291,10 @@ fn run(
         }
         Some(s) => {
             let uri = to_uri(s);
-            // Decode as fast as possible instead of pacing to the media clock.
+            // Decode as fast as possible: the runner's appsink keeps only the
+            // newest frame (max-buffers=1, drop=true, sync=false), so a slow
+            // chain consumes the freshest frame instead of a stale backlog.
             let runner = GstreamRunner::uri(&uri)?;
-            runner.appsink().set_property("sync", false);
             eprintln!("driving pipeline from {uri}");
             FrameSource::Gst(runner)
         }
