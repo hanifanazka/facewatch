@@ -25,7 +25,7 @@ use pupi::{GstreamRunner, GstreamRunnerError};
 use crate::aura::AuraFace;
 use crate::elements::{Chain, OverlayOptions};
 use crate::face::Array3U8;
-use crate::gallery::{Gallery, load_gallery_any};
+use crate::gallery::Gallery;
 use crate::models::Models;
 use crate::rtsp::RtspPublisher;
 use crate::scrfd::Scrfd;
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     // SHA-256 at compile time), so there is no runtime download or lookup.
     let models = Models::embedded();
     let gallery_path = cli.gallery.clone().unwrap_or_else(default_gallery);
-    let gallery = Arc::new(Mutex::new(load_gallery_any(&gallery_path)?));
+    let gallery = Arc::new(Mutex::new(Gallery::load(&gallery_path)?));
 
     if cli.verbose {
         let names = gallery

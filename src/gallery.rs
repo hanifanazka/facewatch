@@ -1,6 +1,5 @@
 //! Face gallery: named embeddings matched by cosine similarity.
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -107,31 +106,6 @@ impl Gallery {
                 .map(|e| e.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        }
-    }
-}
-
-/// Loads a gallery, falling back to per-name direct entries if the path points
-/// at an older flat map format.
-pub fn load_gallery_any(path: &Path) -> Result<Gallery> {
-    if !path.exists() {
-        return Ok(Gallery::default());
-    }
-    match Gallery::load(path) {
-        Ok(g) => Ok(g),
-        Err(_) => {
-            // Try legacy `{"name": [embedding...]}` map format.
-            let raw = std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read gallery {}", path.display()))?;
-            let map: HashMap<String, Vec<f32>> = serde_json::from_str(&raw).with_context(|| {
-                format!("gallery {} is neither list nor map format", path.display())
-            })?;
-            Ok(Gallery {
-                entries: map
-                    .into_iter()
-                    .map(|(name, embedding)| GalleryEntry { name, embedding })
-                    .collect(),
-            })
         }
     }
 }

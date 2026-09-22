@@ -3,8 +3,11 @@
 
 use std::sync::Arc;
 
+use anyhow::{Context, Result, anyhow};
 use image::RgbImage;
 use ndarray::Array4;
+use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
 
 /// Five 2D landmark points: left eye, right eye, nose, left mouth, right mouth.
 pub type Kps = [[f32; 2]; 5];
@@ -115,6 +118,68 @@ pub fn resize_frame(frame: &Array3U8, new_width: usize, new_height: usize) -> Ar
         image::imageops::FilterType::Triangle,
     );
     rgb_to_arr3(&resized)
+}
+
+/// Letterbox-resizes `frame` into `size`x`size` (aspect-fit, top-left,
+/// zero-padded) and returns the resized frame plus the per-axis scale factors
+/// `(scale_x, scale_y)` needed to map detections back to source pixels.
+///
+/// Shared by the SCRFD and YuNet detectors, which use the same framing.
+pub fn letterbox(frame: &Array3U8, size: usize) -> (Array3U8, f32, f32) {
+    let (src_h, src_w) = (frame.shape()[0], frame.shape()[1]);
+
+    // Fit the src aspect ratio inside `size`x`size`, top-left. Sources taller
+    // than wide fix the height; wider sources fix the width.
+    let im_ratio = src_h as f32 / src_w as f32;
+    let (new_w, new_h) = if im_ratio > 1.0 {
+        ((size as f32 / im_ratio).floor().max(1.0) as usize, size)
+    } else {
+        (size, (size as f32 * im_ratio).floor().max(1.0) as usize)
+    };
+    let scale_x = new_w as f32 / src_w as f32;
+    let scale_y = new_h as f32 / src_h as f32;
+
+    (resize_frame(frame, new_w, new_h), scale_x, scale_y)
+}
+
+/// Maps boxes/landmarks from letterbox coordinates back to source-frame
+/// pixels (per-axis scale division), in place. Shared by both detectors.
+pub fn unletterbox(dets: &mut [(f32, [f32; 4], Kps)], scale_x: f32, scale_y: f32) {
+    for det in dets {
+        det.1 = [
+            det.1[0] / scale_x,
+            det.1[1] / scale_y,
+            det.1[2] / scale_x,
+            det.1[3] / scale_y,
+        ];
+        for k in det.2.iter_mut() {
+            k[0] /= scale_x;
+            k[1] /= scale_y;
+        }
+    }
+}
+
+/// Builds an ONNX session from embedded model bytes with the shared runtime
+/// settings: Level3 graph optimization and 2 intra-op threads.
+pub fn load_session(model_bytes: &[u8], name: &str) -> Result<Session> {
+    // ort's SessionBuilder returns `Error<SessionBuilder>`, which is not
+    // `Send + Sync` and therefore cannot be `?`-converted into anyhow;
+    // stringify those errors explicitly. `Session` itself is fine to
+    // `?`/`.context`.
+    let mut builder = Session::builder()?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| anyhow!("ort: {e}"))?
+        .with_intra_threads(2)
+        .map_err(|e| anyhow!("ort: {e}"))?;
+    let session = builder
+        .commit_from_memory(model_bytes)
+        .with_context(|| format!("failed to load {name} model"))?;
+
+    anyhow::ensure!(
+        session.inputs().len() == 1,
+        "{name} model must have exactly one input"
+    );
+    Ok(session)
 }
 
 /// Greedy non-maximum suppression over score-sorted candidate faces, shared by

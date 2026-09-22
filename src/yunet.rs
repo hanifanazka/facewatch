@@ -23,11 +23,10 @@
 
 use anyhow::{Context, Result};
 use ndarray::{Array4, IxDyn};
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, DetectedFace, Kps, non_max_suppression, resize_frame};
+use crate::face::{Array3U8, DetectedFace, Kps, letterbox, load_session, non_max_suppression, unletterbox};
 
 /// YuNet fixed input resolution (square).
 pub const INPUT_SIZE: usize = 640;
@@ -60,19 +59,8 @@ pub struct Yunet {
 impl Yunet {
     /// Builds a detection session from the embedded model bytes.
     pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?;
-        let session = builder
-            .commit_from_memory(model_bytes)
-            .context("failed to load YuNet model")?;
+        let session = load_session(model_bytes, "YuNet")?;
 
-        anyhow::ensure!(
-            session.inputs().len() == 1,
-            "YuNet model must have exactly one input"
-        );
         anyhow::ensure!(
             session.outputs().len() == 12,
             "YuNet model must have 12 outputs (cls/obj/bbox/kps per stride), got {}",
@@ -117,23 +105,7 @@ impl Yunet {
 
     /// Runs detection on an RGB frame. Coordinates are in source-frame pixels.
     pub fn detect(&mut self, frame: &Array3U8) -> Result<Vec<DetectedFace>> {
-        let src_h = frame.shape()[0];
-        let src_w = frame.shape()[1];
-
-        // Letterbox resize: fit the src aspect ratio inside 640x640, top-left
-        // (same framing as the SCRFD stage; YuNet pads the remainder with
-        // black, like FaceDetectorYN's divisor-32 padding).
-        let im_ratio = src_h as f32 / src_w as f32;
-        let (new_w, new_h) = if im_ratio > 1.0 {
-            ((INPUT_SIZE as f32 / im_ratio).floor().max(1.0) as usize, INPUT_SIZE)
-        } else {
-            (INPUT_SIZE, (INPUT_SIZE as f32 * im_ratio).floor().max(1.0) as usize)
-        };
-        // Per-axis scales so x/y map back independently of letterbox padding.
-        let scale_x = new_w as f32 / src_w as f32;
-        let scale_y = new_h as f32 / src_h as f32;
-
-        let resized = resize_frame(frame, new_w, new_h);
+        let (resized, scale_x, scale_y) = letterbox(frame, INPUT_SIZE);
 
         // BGR channels, raw [0, 255], no mean subtraction (mirrors
         // blobFromImage defaults) — fill channels swapped into NCHW.
@@ -209,18 +181,7 @@ impl Yunet {
         };
 
         // Map back to source coordinates (per-axis scales).
-        for det in &mut scores_all {
-            det.1 = [
-                det.1[0] / scale_x,
-                det.1[1] / scale_y,
-                det.1[2] / scale_x,
-                det.1[3] / scale_y,
-            ];
-            for k in det.2.iter_mut() {
-                k[0] /= scale_x;
-                k[1] /= scale_y;
-            }
-        }
+        unletterbox(&mut scores_all, scale_x, scale_y);
 
         Ok(non_max_suppression(scores_all, self.nms_thresh))
     }

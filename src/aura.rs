@@ -3,13 +3,12 @@
 //! `ArcFaceONNX.get_feat` for a model without baked-in normalization:
 //! `(pixel - 127.5) / 127.5` on the RGB channels (no channel swap needed).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ndarray::{Array4, IxDyn};
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, Embedding, fill_nchw};
+use crate::face::{Array3U8, Embedding, fill_nchw, load_session};
 
 /// Input patch size for AuraFace (square 112x112).
 pub const INPUT_SIZE: usize = 112;
@@ -23,23 +22,8 @@ pub struct AuraFace {
 impl AuraFace {
     /// Builds a recognition session from the embedded model bytes.
     pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        // ort's SessionBuilder returns `Error<SessionBuilder>`, which is not
-        // `Send + Sync` and therefore cannot be `?`-converted into anyhow;
-        // stringify those errors explicitly. `Session` itself is fine to
-        // `?`/`.context`.
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?;
-        let session = builder
-            .commit_from_memory(model_bytes)
-            .context("failed to load AuraFace model")?;
+        let session = load_session(model_bytes, "AuraFace recognition")?;
 
-        anyhow::ensure!(
-            session.inputs().len() == 1,
-            "recognition model must have exactly one input"
-        );
         anyhow::ensure!(
             session.outputs().len() == 1,
             "recognition model must have exactly one output"

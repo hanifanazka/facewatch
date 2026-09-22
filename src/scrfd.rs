@@ -1,14 +1,14 @@
 //! SCRFD face detector, decoding mirrored from insightface's `scrfd.py`
 //! (2 anchors per cell, strides 8/16/32, top-left zero-padded letterbox).
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ndarray::{Array4, IxDyn};
-use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::face::{
-    Array3U8, DetectedFace, Kps, fill_nchw, non_max_suppression, resize_frame,
+    Array3U8, DetectedFace, Kps, fill_nchw, letterbox, load_session, non_max_suppression,
+    unletterbox,
 };
 
 /// SCRFD input resolution (width, height).
@@ -32,18 +32,8 @@ pub struct Scrfd {
 impl Scrfd {
     /// Builds a detection session from the embedded model bytes.
     pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        // See aura.rs: ort's SessionBuilder returns `Error<SessionBuilder>`,
-        // which is not `Send + Sync`, so stringify those errors explicitly.
-        let mut builder = Session::builder()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("ort: {e}"))?;
-        let session = builder
-            .commit_from_memory(model_bytes)
-            .context("failed to load SCRFD model")?;
+        let session = load_session(model_bytes, "SCRFD")?;
 
-        anyhow::ensure!(session.inputs().len() == 1, "SCRFD model must have exactly one input");
         anyhow::ensure!(session.outputs().len() == 9, "SCRFD model must have 9 outputs (score/bbox/kps)");
 
         let input_name = session.inputs()[0].name().to_owned();
@@ -57,25 +47,7 @@ impl Scrfd {
 
     /// Runs detection on an RGB frame. Coordinates are in source-frame pixels.
     pub fn detect(&mut self, frame: &Array3U8) -> Result<Vec<DetectedFace>> {
-        let src_h = frame.shape()[0];
-        let src_w = frame.shape()[1];
-
-        // Letterbox resize: fit the src aspect ratio inside 640x640, top-left
-        // (matches insightface's scrfd.py). Taller-than-wide sources fix the
-        // height; wider sources fix the width.
-        let im_ratio = src_h as f32 / src_w as f32;
-        // model_ratio = 640/640 = 1.0; when the image is taller than wide we
-        // fix the height, otherwise we fix the width.
-        let (new_w, new_h) = if im_ratio > 1.0 {
-            ((INPUT_SIZE as f32 / im_ratio).floor().max(1.0) as usize, INPUT_SIZE)
-        } else {
-            (INPUT_SIZE, (INPUT_SIZE as f32 * im_ratio).floor().max(1.0) as usize)
-        };
-        // Per-axis scales so x/y map back independently of letterbox padding.
-        let scale_x = new_w as f32 / src_w as f32;
-        let scale_y = new_h as f32 / src_h as f32;
-
-        let resized = resize_frame(frame, new_w, new_h);
+        let (resized, scale_x, scale_y) = letterbox(frame, INPUT_SIZE);
 
         // Build the NCHW float blob: (x - 127.5) / 128.0, RGB already.
         let mut blob = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
@@ -139,18 +111,7 @@ impl Scrfd {
         };
 
         // Map back to source coordinates (per-axis scales).
-        for det in &mut scores_all {
-            det.1 = [
-                det.1[0] / scale_x,
-                det.1[1] / scale_y,
-                det.1[2] / scale_x,
-                det.1[3] / scale_y,
-            ];
-            for k in det.2.iter_mut() {
-                k[0] /= scale_x;
-                k[1] /= scale_y;
-            }
-        }
+        unletterbox(&mut scores_all, scale_x, scale_y);
 
         Ok(non_max_suppression(scores_all, self.nms_thresh))
     }

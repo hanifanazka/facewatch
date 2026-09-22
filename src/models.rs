@@ -3,14 +3,14 @@
 //! `build.rs` guarantees the files in the models directory (default
 //! `<crate>/models`, override with `FACEWATCH_MODELS_DIR`) exist and pass the
 //! SHA-256 check *before* compilation, then generates `model_meta.rs` below —
-//! metadata consts plus the `include_bytes!` byte slices — so the embedded
+//! each model's size plus its `include_bytes!` byte slice — so the embedded
 //! bytes are always the verified artifacts. No download or checksum logic
 //! runs at runtime.
 
 include!(concat!(env!("OUT_DIR"), "/model_meta.rs"));
 
 /// The three embedded models as byte slices.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct Models {
     pub scrfd: &'static [u8],
     pub yunet: &'static [u8],
