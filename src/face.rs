@@ -116,3 +116,52 @@ pub fn resize_frame(frame: &Array3U8, new_width: usize, new_height: usize) -> Ar
     );
     rgb_to_arr3(&resized)
 }
+
+/// Greedy non-maximum suppression over score-sorted candidate faces, shared by
+/// the SCRFD and YuNet detectors. IoU (with the `+1` area convention) above
+/// `nms_thresh` suppresses the lower-scoring box. Keeps the (usually small)
+/// post-threshold candidate list accurate.
+pub fn non_max_suppression(
+    mut dets: Vec<(f32, [f32; 4], Kps)>,
+    nms_thresh: f32,
+) -> Vec<DetectedFace> {
+    dets.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let n = dets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let mut keep = Vec::with_capacity(n);
+    let mut order: Vec<usize> = (0..n).collect();
+
+    while let Some(&i) = order.first() {
+        keep.push(i);
+        let order_slice = &order[1..];
+        let (_, bi, _) = &dets[i];
+        let area_i = (bi[2] - bi[0] + 1.0) * (bi[3] - bi[1] + 1.0);
+        let mut survived = Vec::with_capacity(order_slice.len());
+        for &j in order_slice {
+            let (_, bj, _) = &dets[j];
+            let xx1 = bi[0].max(bj[0]);
+            let yy1 = bi[1].max(bj[1]);
+            let xx2 = bi[2].min(bj[2]);
+            let yy2 = bi[3].min(bj[3]);
+            let w = (xx2 - xx1 + 1.0).max(0.0);
+            let h = (yy2 - yy1 + 1.0).max(0.0);
+            let inter = w * h;
+            let area_j = (bj[2] - bj[0] + 1.0) * (bj[3] - bj[1] + 1.0);
+            let ovr = inter / (area_i + area_j - inter);
+            if ovr <= nms_thresh {
+                survived.push(j);
+            }
+        }
+        order = survived;
+    }
+
+    keep.into_iter()
+        .map(|i| {
+            let (score, bbox, kps) = dets[i];
+            DetectedFace { bbox, score, kps }
+        })
+        .collect()
+}

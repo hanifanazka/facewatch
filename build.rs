@@ -1,9 +1,9 @@
 //! Build-time model provisioning.
 //!
-//! Guarantees that `scrfd_10g_bnkps.onnx` and `glintr100.onnx` exist in
-//! `models/` **before** the crate compiles: missing, truncated, or tampered
-//! files are downloaded from Hugging Face and verified against the exact
-//! SHA-256 fal publishes (HF LFS blob IDs). The verified files are then
+//! Guarantees that `scrfd_10g_bnkps.onnx`, `face_detection_yunet_2023mar.onnx`,
+//! and `glintr100.onnx` exist in `models/` **before** the crate compiles:
+//! missing, truncated, or tampered files are downloaded and verified against
+//! the exact SHA-256 published for each artifact. The verified files are then
 //! embedded into the binary via `include_bytes!` in `src/models.rs`, so the
 //! app performs no downloads or checksum logic at runtime.
 //!
@@ -36,6 +36,15 @@ const MODEL_SPECS: &[ModelSpec] = &[
         url: "https://huggingface.co/fal/AuraFace-v1/resolve/main/scrfd_10g_bnkps.onnx",
         size: 16_923_827,
         sha256: "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+    },
+    // OpenCV zoo YuNet (2023mar), kept behind Git LFS in opencv_zoo, so the
+    // raw bytes come from the media host rather than a raw-URL pointer file.
+    ModelSpec {
+        prefix: "YUNET",
+        name: "face_detection_yunet_2023mar.onnx",
+        url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+        size: 232_589,
+        sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
     },
     ModelSpec {
         prefix: "AURAFACE",

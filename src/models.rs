@@ -9,10 +9,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/model_meta.rs"));
 
-/// The two embedded models as byte slices.
+/// The three embedded models as byte slices.
 #[derive(Clone, Copy, Debug)]
 pub struct Models {
     pub scrfd: &'static [u8],
+    pub yunet: &'static [u8],
     pub auraface: &'static [u8],
 }
 
@@ -22,6 +23,7 @@ impl Models {
     pub fn embedded() -> Models {
         Models {
             scrfd: SCRFD_BYTES,
+            yunet: YUNET_BYTES,
             auraface: AURAFACE_BYTES,
         }
     }
@@ -36,6 +38,7 @@ mod tests {
         // build.rs already hash-verified the exact bytes that were embedded;
         // this guards the generated include/const plumbing at dev time.
         assert_eq!(SCRFD_BYTES.len(), SCRFD_SIZE);
+        assert_eq!(YUNET_BYTES.len(), YUNET_SIZE);
         assert_eq!(AURAFACE_BYTES.len(), AURAFACE_SIZE);
     }
 }

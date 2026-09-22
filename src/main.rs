@@ -1,5 +1,6 @@
-//! facewatch: webcam face recognition on the pupi push-pipeline, using SCRFD
-//! (detection) + AuraFace (recognition) through ONNX Runtime (ort).
+//! facewatch: webcam face recognition on the pupi push-pipeline, using YuNet
+//! (default) or SCRFD detection + AuraFace recognition through ONNX Runtime
+//! (ort).
 
 mod align;
 mod aura;
@@ -11,6 +12,7 @@ mod models;
 mod profile;
 mod rtsp;
 mod scrfd;
+mod yunet;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,12 +44,16 @@ fn default_gallery() -> PathBuf {
 #[command(
     name = "facewatch",
     version,
-    about = "Webcam face recognition on the pupi push-pipeline (SCRFD + AuraFace, ONNX Runtime)."
+    about = "Webcam face recognition on the pupi push-pipeline (YuNet/SCRFD + AuraFace, ONNX Runtime)."
 )]
 struct Cli {
     /// Minimum cosine similarity required for a gallery match.
     #[arg(long, default_value_t = 0.40)]
     threshold: f32,
+
+    /// Face detector backend: "yunet" (default) or "scrfd".
+    #[arg(long, default_value = "yunet")]
+    detector: String,
 
     /// Gallery JSON path (defaults to ~/.facewatch/gallery.json).
     #[arg(long)]
@@ -265,7 +271,13 @@ fn run(
         profile::enable();
     }
 
-    let chain = Chain::new(models, Arc::clone(gallery), cli.threshold, overlay_opts(cli))?;
+    let chain = Chain::new(
+        models,
+        Arc::clone(gallery),
+        cli.threshold,
+        overlay_opts(cli),
+        &cli.detector,
+    )?;
 
     let source = match source {
         Some(s) if s.starts_with("image:") => {
@@ -382,7 +394,13 @@ fn analyze_image(
     gallery: &Arc<Mutex<Gallery>>,
     path: &PathBuf,
 ) -> Result<()> {
-    let chain = Chain::new(models, Arc::clone(gallery), cli.threshold, overlay_opts(cli))?;
+    let chain = Chain::new(
+        models,
+        Arc::clone(gallery),
+        cli.threshold,
+        overlay_opts(cli),
+        &cli.detector,
+    )?;
     let frame = load_image_frame(path)?;
     let (frame_w, frame_h) = (frame.shape()[1], frame.shape()[0]);
 

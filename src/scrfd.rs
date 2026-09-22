@@ -7,7 +7,9 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, DetectedFace, Kps, fill_nchw, resize_frame};
+use crate::face::{
+    Array3U8, DetectedFace, Kps, fill_nchw, non_max_suppression, resize_frame,
+};
 
 /// SCRFD input resolution (width, height).
 pub const INPUT_SIZE: usize = 640;
@@ -150,50 +152,6 @@ impl Scrfd {
             }
         }
 
-        Ok(self.nms(scores_all))
-    }
-
-    /// Standard NMS over the score-sorted candidates (stays accurate for the
-    /// (usually small) number of post-threshold boxes).
-    fn nms(&self, mut dets: Vec<(f32, [f32; 4], Kps)>) -> Vec<DetectedFace> {
-        dets.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let n = dets.len();
-        if n == 0 {
-            return Vec::new();
-        }
-
-        let mut keep = Vec::with_capacity(n);
-        let mut order: Vec<usize> = (0..n).collect();
-
-        while let Some(&i) = order.first() {
-            keep.push(i);
-            let order_slice = &order[1..];
-            let (_, bi, _) = &dets[i];
-            let area_i = (bi[2] - bi[0] + 1.0) * (bi[3] - bi[1] + 1.0);
-            let mut survived = Vec::with_capacity(order_slice.len());
-            for &j in order_slice {
-                let (_, bj, _) = &dets[j];
-                let xx1 = bi[0].max(bj[0]);
-                let yy1 = bi[1].max(bj[1]);
-                let xx2 = bi[2].min(bj[2]);
-                let yy2 = bi[3].min(bj[3]);
-                let w = (xx2 - xx1 + 1.0).max(0.0);
-                let h = (yy2 - yy1 + 1.0).max(0.0);
-                let inter = w * h;
-                let area_j = (bj[2] - bj[0] + 1.0) * (bj[3] - bj[1] + 1.0);
-                let ovr = inter / (area_i + area_j - inter);
-                if ovr <= self.nms_thresh {
-                    survived.push(j);
-                }
-            }
-            order = survived;
-        }
-
-        keep.into_iter()
-            .map(|i| {
-                let (score, bbox, kps) = dets[i];
-                DetectedFace { bbox, score, kps }
-            })
-            .collect()
+        Ok(non_max_suppression(scores_all, self.nms_thresh))
     }
 }

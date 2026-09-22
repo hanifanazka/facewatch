@@ -1,13 +1,13 @@
 # facewatch
 
 A webcam face-recognition binary that drives **pupi**'s push-pipeline
-end-to-end: live webcam frames flow through SCRFD detection, AuraFace
-recognition, gallery matching, and an annotated overlay — which is then
-published over RTSP to a **mediamtx** server for any client to watch.
+end-to-end: live webcam frames flow through YuNet (default) or SCRFD detection,
+AuraFace recognition, gallery matching, and an annotated overlay — which is
+then published over RTSP to a **mediamtx** server for any client to watch.
 
 ```
 webcam (GStreamer) ──► Detection ──► Recognition ──► Matching ──► OverlaySink ──► appsrc
-       RGB frame         SCRFD        112×112 → 512-d   cosine vs   boxes/labels │ x264enc (ultrafast,
+       RGB frame      YuNet/SCRFD    112×112 → 512-d   cosine vs   boxes/labels │ x264enc (ultrafast,
                                                          gallery     fps, verbose  │ zerolatency, 2000 kbps)
                                                                    ┌──────────────┘
                                                                    ▼
@@ -33,13 +33,14 @@ cargo build --release
 
 ### Models
 
-Two ONNX models are **downloaded and SHA-256 verified at build time** and then
-**embedded into the binary**: `build.rs` ensures `scrfd_10g_bnkps.onnx` and
-`glintr100.onnx` exist in `models/` (fetching them from
-`https://huggingface.co/fal/AuraFace-v1` when absent, and checking every file
-against the exact hash fal publishes before the crate compiles), and
-`src/models.rs` packages the verified files with `include_bytes!`. The app
-performs no downloads or checksum logic at runtime.
+Three ONNX models are **downloaded and SHA-256 verified at build time** and then
+**embedded into the binary**: `build.rs` ensures `scrfd_10g_bnkps.onnx`,
+`face_detection_yunet_2023mar.onnx`, and `glintr100.onnx` exist in `models/`
+(fetching them when absent — SCRFD/AuraFace from
+`https://huggingface.co/fal/AuraFace-v1`, YuNet from the OpenCV model zoo —
+and checking every file against the exact published hash before the crate
+compiles), and `src/models.rs` packages the verified files with
+`include_bytes!`. The app performs no downloads or checksum logic at runtime.
 
 The models directory defaults to `models/` next to `Cargo.toml`; override it
 with `FACEWATCH_MODELS_DIR=/path` when building.
@@ -56,15 +57,16 @@ with `FACEWATCH_MODELS_DIR=/path` when building.
 > through the same AuraFace repo under its Apache-2.0 model card, but its ONNX
 > export stamp (`pytorch 1.6`, 2021) shows it is the original insightface
 > export re-hosted — insightface's own pretrained models carry a
-> "non-commercial research only" notice. If your compliance review requires
-> the detector weights to originate from a non-insightface lineage, swap this
-> one file (a functionally equivalent 5-point-landmark detector can be slotted
-> into the same element). All Rust dependencies are permissive (MIT /
-> Apache-2.0); no GPL/AGPL code is linked.
+> "non-commercial research only" notice. The **default detector is now YuNet**
+> (`face_detection_yunet_2023mar.onnx` from the OpenCV model zoo, Apache-2.0,
+> no insightface lineage), which removes this concern entirely; SCRFD remains
+> embedded behind `--detector scrfd` for A/B comparison. All Rust dependencies
+> are permissive (MIT / Apache-2.0); no GPL/AGPL code is linked.
 
 | Model | Input | Output |
 |---|---|---|
 | `scrfd_10g_bnkps.onnx` (~16 MiB) | `[1,3,640,640]` f32, `(x-127.5)/128`, RGB | 9× rank-2 `[count,…]` (score/bbox/kps, strides 8/16/32) |
+| `face_detection_yunet_2023mar.onnx` (~227 KiB) | `[1,3,640,640]` f32, BGR, raw `[0,255]`, no mean | 12× (cls/obj/bbox/kps, strides 8/16/32) |
 | `glintr100.onnx` (~248 MiB) | `[1,3,112,112]` f32, `(x-127.5)/127.5` (no baked-in Sub/Mul) | `[1,512]` |
 
 **Model integrity.** `build.rs` verifies every model file against the exact
@@ -75,6 +77,7 @@ artifacts:
 
 ```
 scrfd_10g_bnkps.onnx  5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91
+face_detection_yunet_2023mar.onnx  8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 glintr100.onnx        a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60
 ```
 
@@ -102,6 +105,7 @@ facewatch image photo.jpg
 
 | Flag | Default | Description |
 |---|---|---|
+| `--detector NAME` | `yunet` | Detector backend: `yunet` (OpenCV zoo, default) or `scrfd` |
 | `--threshold F` | `0.40` | Minimum cosine similarity for a gallery match |
 | `--gallery PATH` | `~/.facewatch/gallery.json` | Gallery JSON path |
 | `--rtsp URL` | `rtsp://127.0.0.1:8554/facewatch` | Publish the annotated stream to this RTSP URL |
@@ -168,11 +172,16 @@ Frames from GStreamer are forced to `RGB` via a `capsfilter` on the appsink, so
 no channel swapping happens anywhere in the app. All preprocessing mirrors the
 insightface reference implementations:
 
-- **Detection (SCRFD)** — letterbox resize to 640×640 (top-left, zero-padded),
-  `(x-127.5)/128`, anchors at `(col·stride, row·stride)` duplicated ×2, decode
-  `score/bbox/kps` for strides 8/16/32, `/det_scale`, NMS @ IoU 0.4, keep
-  `score ≥ 0.5`. Boxes/kps are back in source-frame pixels and match an
-  onnxruntime reference to < 0.2 px.
+- **Detection** — selectable via `--detector`:
+  - **YuNet (default)** — letterbox resize to 640×640 (top-left, zero-padded),
+    BGR `[0,255]` blob (no mean), decode the 12 per-stride outputs
+    (cls/obj/bbox/kps, strides 8/16/32) with `score = √(cls·obj)`, keep
+    `score ≥ 0.9`, NMS @ IoU 0.3. Mirrors OpenCV's `FaceDetectorYN`; no
+    landmark reorder is needed (YuNet's order coincides with the app's).
+  - **SCRFD** — letterbox resize to 640×640, `(x-127.5)/128`, anchors at
+    `(col·stride, row·stride)` duplicated ×2, decode `score/bbox/kps` for
+    strides 8/16/32, NMS @ IoU 0.4, keep `score ≥ 0.5`.
+  - Both map boxes/kps back to source-frame pixels.
 - **Alignment** — five-landmark similarity transform (`SimilarityTransform`
   Umeyama equivalent) onto the canonical ArcFace 112×112 template, then
   `warpAffine`-style bilinear warp with zero border (`warpAffine` samples

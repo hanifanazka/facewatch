@@ -17,8 +17,39 @@ use crate::face::{
     Array3U8, DetectedFace, FaceEmbeddings, FaceFrame, FaceMatches, Rgb, arr3_to_rgb, rgb_to_arr3,
 };
 use crate::gallery::Gallery;
+use crate::models::Models;
 use crate::profile;
 use crate::scrfd::Scrfd;
+use crate::yunet::Yunet;
+
+/// Selectable face-detection backend; keeps both ONNX detectors embedded for
+/// A/B comparison (`--detector scrfd` vs the default `yunet`).
+pub enum Detector {
+    Scrfd(Scrfd),
+    Yunet(Yunet),
+}
+
+impl Detector {
+    /// Loads the requested backend (`"scrfd"` or, by default, `"yunet"`) from
+    /// the embedded model bytes.
+    pub fn load(kind: &str, models: &Models) -> Result<Self> {
+        match kind {
+            "scrfd" => Ok(Detector::Scrfd(Scrfd::load(models.scrfd)?)),
+            "yunet" => Ok(Detector::Yunet(Yunet::load(models.yunet)?)),
+            other => anyhow::bail!(
+                "unknown detector {other:?} (expected \"yunet\" or \"scrfd\")"
+            ),
+        }
+    }
+
+    /// Runs detection on an RGB frame, delegating to the active backend.
+    pub fn detect(&mut self, frame: &Array3U8) -> Result<Vec<DetectedFace>> {
+        match self {
+            Detector::Scrfd(d) => d.detect(frame),
+            Detector::Yunet(d) => d.detect(frame),
+        }
+    }
+}
 
 /// Creates a sink pad accepting `I` and a source pad offering `O` linked by a
 /// synchronous transform callback.
@@ -84,7 +115,7 @@ impl<I: 'static, O: 'static> Element for Stage<I, O> {
 pub type DetectionElement = Stage<Array3U8, FaceFrame>;
 
 impl Stage<Array3U8, FaceFrame> {
-    pub fn new(detector: Scrfd) -> Self {
+    pub fn new(detector: Detector) -> Self {
         let mut detector = detector;
         Stage::from_transform(move |buffer| {
             let frame = buffer
@@ -197,14 +228,16 @@ pub struct Chain {
 }
 
 impl Chain {
-    /// Builds the chain from the given models and gallery.
+    /// Builds the chain from the given models and gallery. `detector` selects
+    /// the detection backend (`"scrfd"` or `"yunet"`).
     pub fn new(
-        models: &crate::models::Models,
+        models: &Models,
         gallery: Arc<Mutex<Gallery>>,
         threshold: f32,
         options: OverlayOptions,
+        detector: &str,
     ) -> Result<Self> {
-        let detector = Scrfd::load(models.scrfd)?;
+        let detector = Detector::load(detector, models)?;
         let aura = AuraFace::load(models.auraface)?;
         let (tx, display_rx) = std::sync::mpsc::channel::<Array3U8>();
 
