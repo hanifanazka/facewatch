@@ -17,6 +17,7 @@ use crate::face::{
     Array3U8, DetectedFace, FaceEmbeddings, FaceFrame, FaceMatches, Rgb, arr3_to_rgb, rgb_to_arr3,
 };
 use crate::gallery::Gallery;
+use crate::profile;
 use crate::scrfd::Scrfd;
 
 /// Creates a sink pad accepting `I` and a source pad offering `O` linked by a
@@ -90,7 +91,7 @@ impl Stage<Array3U8, FaceFrame> {
                 .downcast_ref::<Array3U8>()
                 .ok_or("expected Array3<u8> frame")?
                 .clone();
-            let faces = detector.detect(&frame).map_err(|e| e.to_string())?;
+            let faces = profile::time("detect", || detector.detect(&frame)).map_err(|e| e.to_string())?;
             Ok(Buffer::new(FaceFrame {
                 src: Arc::new(frame),
                 faces,
@@ -112,8 +113,9 @@ impl Stage<FaceFrame, FaceEmbeddings> {
                 .clone();
             let mut embeddings = Vec::with_capacity(frame.faces.len());
             for face in &frame.faces {
-                let crop = align::norm_crop(&frame.src, &face.kps, 112);
-                let embedding = aura.embed(&crop).map_err(|e| e.to_string())?;
+                let crop = profile::time("align", || align::norm_crop(&frame.src, &face.kps, 112));
+                let embedding =
+                    profile::time("embed", || aura.embed(&crop)).map_err(|e| e.to_string())?;
                 embeddings.push(embedding);
             }
             Ok(Buffer::new(FaceEmbeddings {
@@ -171,7 +173,7 @@ impl Stage<FaceMatches, ()> {
                 .downcast_ref::<FaceMatches>()
                 .ok_or("expected FaceMatches")?
                 .clone();
-            render_overlay(&matches, &options, &display_tx, &mut state);
+            profile::time("draw", || render_overlay(&matches, &options, &display_tx, &mut state));
             Ok(Buffer::new(()))
         })
     }

@@ -8,14 +8,17 @@ mod elements;
 mod face;
 mod gallery;
 mod models;
+mod profile;
 mod rtsp;
 mod scrfd;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use gstreamer::prelude::*;
 use pupi::{GstreamRunner, GstreamRunnerError};
 
 use crate::aura::AuraFace;
@@ -70,6 +73,10 @@ struct Cli {
     #[arg(long)]
     verbose: bool,
 
+    /// Print a per-frame stage timing summary (mean/p50/p90/max) when a run ends.
+    #[arg(long)]
+    profile: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -83,8 +90,14 @@ enum Command {
         /// Optional image file; uses a webcam snapshot when omitted.
         image: Option<PathBuf>,
     },
-    /// Run live webcam face recognition.
+    /// Run face recognition from the webcam, a media URI, or a still image.
     Run {
+        /// Frame source: a file/RTSP URI (e.g. `file:///path/v.mp4`), a bare
+        /// local path, `image:<path>` to loop a still image, or the webcam by
+        /// default.
+        #[arg(long)]
+        source: Option<String>,
+
         /// Stop after processing this many frames (~0.5-2 fps on this box).
         #[arg(long)]
         frames: Option<u64>,
@@ -124,7 +137,7 @@ fn main() -> Result<()> {
                 cli.save_dir.as_ref(),
             )
         }
-        Command::Run { frames } => run(&cli, &models, &gallery, *frames),
+        Command::Run { frames, source } => run(&cli, &models, &gallery, *frames, source),
         Command::Image { path } => analyze_image(&cli, &models, &gallery, path),
     }
 }
@@ -212,71 +225,153 @@ fn register(
     Ok(())
 }
 
-/// Builds the linked chain and drives it from the default webcam.
+/// Where the next frame comes from while driving the chain.
+enum FrameSource {
+    /// Live GStreamer source (webcam or file/RTSP URI); each `pull_frame`
+    /// pushes synchronously into the chain.
+    Gst(GstreamRunner),
+    /// A single still image looped through the chain (no GStreamer needed).
+    Stills(Array3U8),
+}
+
+/// Turns a `--source` argument into a URI for `uridecodebin`: already-URIs
+/// pass through, bare paths become absolute `file://` URIs.
+fn to_uri(source: &str) -> String {
+    if source.contains("://") {
+        return source.to_owned();
+    }
+    let path = Path::new(source);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    format!("file://{}", path.display())
+}
+
+/// Builds the linked chain and drives it from the webcam, a `--source` URI, or
+/// a looped still image. With `--profile`, per-frame stage timings are
+/// accumulated and a summary is printed when the run ends.
 fn run(
     cli: &Cli,
     models: &Models,
     gallery: &Arc<Mutex<Gallery>>,
     frames: Option<u64>,
+    source: &Option<String>,
 ) -> Result<()> {
-    let chain = Chain::new(models, Arc::clone(gallery), cli.threshold, overlay_opts(cli))?;
-
-    let runner = GstreamRunner::webcam()?;
-    elements::link_upstream(&runner, &chain.detection)?;
-    elements::negotiate_upstream(&runner)?;
-
-    eprintln!("driving pipeline from GStreamer webcam source");
-    if cli.save_dir.is_some() {
-        eprintln!("saving annotated frames to {}", cli.save_dir.as_ref().unwrap().display());
+    if cli.profile {
+        profile::enable();
     }
 
-    runner.start_pipeline()?;
+    let chain = Chain::new(models, Arc::clone(gallery), cli.threshold, overlay_opts(cli))?;
+
+    let source = match source {
+        Some(s) if s.starts_with("image:") => {
+            let path = s.trim_start_matches("image:");
+            let frame = load_image_frame(&PathBuf::from(path))?;
+            anyhow::ensure!(
+                frames.is_some(),
+                "a still-image source needs --frames so the loop can end"
+            );
+            eprintln!("driving pipeline from still image {path} (looped)");
+            FrameSource::Stills(frame)
+        }
+        Some(s) => {
+            let uri = to_uri(s);
+            // Decode as fast as possible instead of pacing to the media clock.
+            let runner = GstreamRunner::uri(&uri)?;
+            runner.appsink().set_property("sync", false);
+            eprintln!("driving pipeline from {uri}");
+            FrameSource::Gst(runner)
+        }
+        None => {
+            eprintln!("driving pipeline from GStreamer webcam source");
+            FrameSource::Gst(GstreamRunner::webcam()?)
+        }
+    };
+
+    if let FrameSource::Gst(runner) = &source {
+        elements::link_upstream(runner, &chain.detection)?;
+        elements::negotiate_upstream(runner)?;
+        runner.start_pipeline()?;
+    }
+
+    if cli.save_dir.is_some() {
+        eprintln!(
+            "saving annotated frames to {}",
+            cli.save_dir.as_ref().unwrap().display()
+        );
+    }
+
     let mut publisher: Option<RtspPublisher> = None;
 
     let mut processed: u64 = 0;
     let result = loop {
-        match runner.pull_frame() {
-            Ok(Some(_)) => {}
-            Ok(None) => break Ok(()), // end of stream
-            Err(GstreamRunnerError::PullSample(_)) => continue,
-            Err(e) => break Err(anyhow!("frame pull failed: {e}")),
+        let iter_start = Instant::now();
+
+        // Frame acquisition. For GStreamer sources the whole synchronous chain
+        // runs inside pull_frame, so its latency lands in the "pull" stage;
+        // for stills the push happens explicitly below.
+        match &source {
+            FrameSource::Gst(runner) => match profile::time("pull", || runner.pull_frame()) {
+                Ok(Some(_)) => {}
+                Ok(None) => break Ok(()), // end of stream
+                Err(GstreamRunnerError::PullSample(_)) => continue,
+                Err(e) => break Err(anyhow!("frame pull failed: {e}")),
+            },
+            FrameSource::Stills(frame) => {
+                if let Some(limit) = frames {
+                    if processed >= limit {
+                        break Ok(());
+                    }
+                }
+                chain.push_frame(frame.clone())?;
+            }
         }
         processed += 1;
 
         // Drain the annotated-frame channel (keeping the newest frame) and
         // publish it over RTSP. The publisher is created lazily from the
         // first frame's dimensions.
-        let mut latest = None;
-        while let Ok(frame) = chain.display_rx.try_recv() {
-            latest = Some(frame);
-        }
-        if let (Some(frame), false) = (&latest, cli.no_rtsp) {
-            let (h, w, _) = frame.dim();
-            if publisher.is_none() {
-                let mut p = RtspPublisher::new(&cli.rtsp, w as u32, h as u32)?;
-                p.start()?;
-                publisher = Some(p);
+        profile::time("publish", || {
+            let mut latest = None;
+            while let Ok(frame) = chain.display_rx.try_recv() {
+                latest = Some(frame);
             }
-            publisher
-                .as_mut()
-                .expect("publisher was just created")
-                .push_frame(&frame)?;
-        }
+            if let (Some(frame), false) = (&latest, cli.no_rtsp) {
+                let (h, w, _) = frame.dim();
+                if publisher.is_none() {
+                    let mut p = RtspPublisher::new(&cli.rtsp, w as u32, h as u32)?;
+                    p.start()?;
+                    publisher = Some(p);
+                }
+                publisher
+                    .as_mut()
+                    .expect("publisher was just created")
+                    .push_frame(&frame)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        profile::record("total", iter_start.elapsed());
+        profile::frame_done();
 
         if !cli.verbose && processed % 90 == 1 {
             eprintln!("{processed} frames processed");
-        }
-
-        if let Some(limit) = frames {
-            if processed >= limit {
-                break Ok(());
-            }
         }
     };
     if let Some(p) = publisher.as_mut() {
         p.stop();
     }
-    runner.stop().ok();
+    if let FrameSource::Gst(runner) = &source {
+        runner.stop().ok();
+    }
+
+    if cli.profile {
+        eprintln!("{}", profile::report());
+    }
     result
 }
 
