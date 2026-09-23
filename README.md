@@ -93,6 +93,8 @@ facewatch register alice photo.jpg
 facewatch run
 facewatch run --frames 20 --verbose
 
+# ^C stops any live run gracefully between frames (and prints the --profile summary)
+
 # Publish to a different endpoint, or process headlessly without streaming
 facewatch run --rtsp rtsp://127.0.0.1:8554/cam1
 facewatch run --no-rtsp

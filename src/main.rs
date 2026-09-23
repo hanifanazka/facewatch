@@ -15,6 +15,7 @@ mod scrfd;
 mod yunet;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -104,6 +105,8 @@ enum Command {
         source: Option<String>,
 
         /// Stop after processing this many frames (~0.5-2 fps on this box).
+        /// Applies to live sources too: the webcam and URI paths otherwise run
+        /// until ^C (or end of stream for files).
         #[arg(long)]
         frames: Option<u64>,
     },
@@ -114,8 +117,17 @@ enum Command {
     },
 }
 
+/// Set when the process receives SIGINT (^C). The run loop checks it between
+/// frames, so even an unbounded live session stops cleanly and prints its
+/// `--profile` report instead of being killed without one.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Graceful ^C handling: the loop breaks as if it hit its natural end.
+    ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst))
+        .context("failed to install ^C handler")?;
 
     // The ONNX models are embedded in the binary by build.rs (verified via
     // SHA-256 at compile time), so there is no runtime download or lookup.
@@ -323,6 +335,15 @@ fn run(
     let result = loop {
         let iter_start = Instant::now();
 
+        // Bound the run: `--frames` applies to every source (the webcam and
+        // file-URI paths have no natural end), and a ^C interrupt stops the
+        // loop between frames so the --profile report still prints.
+        if INTERRUPTED.load(Ordering::SeqCst)
+            || matches!(frames, Some(limit) if processed >= limit)
+        {
+            break Ok(());
+        }
+
         // Frame acquisition. For GStreamer sources the whole synchronous chain
         // runs inside pull_frame, so its latency lands in the "pull" stage;
         // for stills the push happens explicitly below.
@@ -334,11 +355,6 @@ fn run(
                 Err(e) => break Err(anyhow!("frame pull failed: {e}")),
             },
             FrameSource::Stills(frame) => {
-                if let Some(limit) = frames {
-                    if processed >= limit {
-                        break Ok(());
-                    }
-                }
                 chain.push_frame(frame.clone())?;
             }
         }
