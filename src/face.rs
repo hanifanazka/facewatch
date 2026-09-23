@@ -160,8 +160,8 @@ pub fn unletterbox(dets: &mut [(f32, [f32; 4], Kps)], scale_x: f32, scale_y: f32
 }
 
 /// Builds an ONNX session from embedded model bytes with the shared runtime
-/// settings: Level3 graph optimization and 2 intra-op threads.
-pub fn load_session(model_bytes: &[u8], name: &str) -> Result<Session> {
+/// settings: Level3 graph optimization and `threads` intra-op threads.
+pub fn load_session(model_bytes: &[u8], name: &str, threads: usize) -> Result<Session> {
     // ort's SessionBuilder returns `Error<SessionBuilder>`, which is not
     // `Send + Sync` and therefore cannot be `?`-converted into anyhow;
     // stringify those errors explicitly. `Session` itself is fine to
@@ -169,7 +169,7 @@ pub fn load_session(model_bytes: &[u8], name: &str) -> Result<Session> {
     let mut builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|e| anyhow!("ort: {e}"))?
-        .with_intra_threads(2)
+        .with_intra_threads(threads)
         .map_err(|e| anyhow!("ort: {e}"))?;
     let session = builder
         .commit_from_memory(model_bytes)
@@ -180,6 +180,31 @@ pub fn load_session(model_bytes: &[u8], name: &str) -> Result<Session> {
         "{name} model must have exactly one input"
     );
     Ok(session)
+}
+
+/// Detector input size used when `--input-size` is not given.
+pub const DEFAULT_DETECT_SIZE: usize = 640;
+
+/// Errors if the model is exported with a *fixed* input size that differs from
+/// `size` (dynamic-shape models such as YuNet accept any multiple of 32; the
+/// bundled SCRFD export may be fixed at 640). Inspects the session input's
+/// tensor shape; dynamic dimensions are `-1` and are skipped.
+pub fn ensure_fixed_input_fits(session: &Session, size: usize, what: &str) -> Result<()> {
+    let Some(shape) = session.inputs()[0].dtype().tensor_shape() else {
+        return Ok(());
+    };
+    let dims: Vec<i64> = shape.iter().copied().collect();
+    if dims.len() == 4 {
+        for &d in &dims[2..] {
+            if d > 0 && d != size as i64 {
+                anyhow::bail!(
+                    "{what} input is fixed at {d}x{d}; --input-size {size} needs a \
+                     dynamic-shape model"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Greedy non-maximum suppression over score-sorted candidate faces, shared by

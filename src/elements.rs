@@ -32,10 +32,10 @@ pub enum Detector {
 impl Detector {
     /// Loads the requested backend (`"scrfd"` or, by default, `"yunet"`) from
     /// the embedded model bytes.
-    pub fn load(kind: &str, models: &Models) -> Result<Self> {
+    pub fn load(kind: &str, models: &Models, threads: usize, input_size: usize) -> Result<Self> {
         match kind {
-            "scrfd" => Ok(Detector::Scrfd(Scrfd::load(models.scrfd)?)),
-            "yunet" => Ok(Detector::Yunet(Yunet::load(models.yunet)?)),
+            "scrfd" => Ok(Detector::Scrfd(Scrfd::load(models.scrfd, threads, input_size)?)),
+            "yunet" => Ok(Detector::Yunet(Yunet::load(models.yunet, threads, input_size)?)),
             other => anyhow::bail!(
                 "unknown detector {other:?} (expected \"yunet\" or \"scrfd\")"
             ),
@@ -229,16 +229,20 @@ pub struct Chain {
 
 impl Chain {
     /// Builds the chain from the given models and gallery. `detector` selects
-    /// the detection backend (`"scrfd"` or `"yunet"`).
+    /// the detection backend (`"scrfd"` or `"yunet"`), `threads` sets the
+    /// per-session ONNX intra-op thread count, and `input_size` the detector
+    /// input resolution (320 or 640).
     pub fn new(
         models: &Models,
         gallery: Arc<Mutex<Gallery>>,
         threshold: f32,
         options: OverlayOptions,
         detector: &str,
+        threads: usize,
+        input_size: usize,
     ) -> Result<Self> {
-        let detector = Detector::load(detector, models)?;
-        let aura = AuraFace::load(models.auraface)?;
+        let detector = Detector::load(detector, models, threads, input_size)?;
+        let aura = AuraFace::load(models.auraface, threads)?;
         let (tx, display_rx) = std::sync::mpsc::channel::<Array3U8>();
 
         let detection = DetectionElement::new(detector);

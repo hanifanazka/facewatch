@@ -55,6 +55,14 @@ struct Cli {
     #[arg(long, default_value = "yunet")]
     detector: String,
 
+    /// ONNX intra-op threads per model session (default: logical CPU count).
+    #[arg(long)]
+    threads: Option<usize>,
+
+    /// Detector input size in pixels: 320 (faster, lower resolution) or 640 (default).
+    #[arg(long, default_value_t = crate::face::DEFAULT_DETECT_SIZE)]
+    input_size: usize,
+
     /// Gallery JSON path (defaults to ~/.facewatch/gallery.json).
     #[arg(long)]
     gallery: Option<PathBuf>,
@@ -125,6 +133,13 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    anyhow::ensure!(
+        matches!(cli.input_size, 320 | 640),
+        "--input-size must be 320 or 640, got {}",
+        cli.input_size
+    );
+    let threads = model_threads(&cli);
+
     // Graceful ^C handling: the loop breaks as if it hit its natural end.
     ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst))
         .context("failed to install ^C handler")?;
@@ -152,11 +167,25 @@ fn main() -> Result<()> {
                 &gallery_path,
                 &gallery,
                 cli.save_dir.as_ref(),
+                threads,
+                cli.input_size,
             )
         }
-        Command::Run { frames, source } => run(&cli, &models, &gallery, *frames, source),
-        Command::Image { path } => analyze_image(&cli, &models, &gallery, path),
+        Command::Run { frames, source } => {
+            run(&cli, &models, &gallery, *frames, source, threads)
+        }
+        Command::Image { path } => analyze_image(&cli, &models, &gallery, path, threads),
     }
+}
+
+/// Effective ONNX intra-op thread count per model session: `--threads`, else
+/// the logical CPU count (fallback 2 when it cannot be determined).
+fn model_threads(cli: &Cli) -> usize {
+    cli.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+    })
 }
 
 /// Loads an image file as an RGB `Array3<u8>` frame.
@@ -197,13 +226,15 @@ fn register(
     gallery_path: &PathBuf,
     gallery: &Arc<Mutex<Gallery>>,
     save_dir: Option<&PathBuf>,
+    threads: usize,
+    input_size: usize,
 ) -> Result<()> {
     if name.trim().is_empty() {
         anyhow::bail!("registration name must not be empty");
     }
 
-    let mut detector = Scrfd::load(models.scrfd)?;
-    let mut aura = AuraFace::load(models.auraface)?;
+    let mut detector = Scrfd::load(models.scrfd, threads, input_size)?;
+    let mut aura = AuraFace::load(models.auraface, threads)?;
 
     let frame = match image {
         Some(path) => load_image_frame(path)?,
@@ -277,6 +308,7 @@ fn run(
     gallery: &Arc<Mutex<Gallery>>,
     frames: Option<u64>,
     source: &Option<String>,
+    threads: usize,
 ) -> Result<()> {
     if cli.profile {
         profile::enable();
@@ -288,6 +320,8 @@ fn run(
         cli.threshold,
         overlay_opts(cli),
         &cli.detector,
+        threads,
+        cli.input_size,
     )?;
 
     let source = match source {
@@ -410,6 +444,7 @@ fn analyze_image(
     models: &Models,
     gallery: &Arc<Mutex<Gallery>>,
     path: &PathBuf,
+    threads: usize,
 ) -> Result<()> {
     let chain = Chain::new(
         models,
@@ -417,6 +452,8 @@ fn analyze_image(
         cli.threshold,
         overlay_opts(cli),
         &cli.detector,
+        threads,
+        cli.input_size,
     )?;
     let frame = load_image_frame(path)?;
     let (frame_w, frame_h) = (frame.shape()[1], frame.shape()[0]);

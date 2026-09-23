@@ -21,8 +21,8 @@ pub struct AuraFace {
 
 impl AuraFace {
     /// Builds a recognition session from the embedded model bytes.
-    pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        let session = load_session(model_bytes, "AuraFace recognition")?;
+    pub fn load(model_bytes: &[u8], threads: usize) -> Result<Self> {
+        let session = load_session(model_bytes, "AuraFace recognition", threads)?;
 
         anyhow::ensure!(
             session.outputs().len() == 1,

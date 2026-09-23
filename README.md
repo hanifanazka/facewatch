@@ -35,7 +35,7 @@ cargo build --release
 
 Three ONNX models are **downloaded and SHA-256 verified at build time** and then
 **embedded into the binary**: `build.rs` ensures `scrfd_10g_bnkps.onnx`,
-`face_detection_yunet_2023mar.onnx`, and `glintr100.onnx` exist in `models/`
+`face_detection_yunet_2026may.onnx`, and `glintr100.onnx` exist in `models/`
 (fetching them when absent — SCRFD/AuraFace from
 `https://huggingface.co/fal/AuraFace-v1`, YuNet from the OpenCV model zoo —
 and checking every file against the exact published hash before the crate
@@ -58,7 +58,7 @@ with `FACEWATCH_MODELS_DIR=/path` when building.
 > export stamp (`pytorch 1.6`, 2021) shows it is the original insightface
 > export re-hosted — insightface's own pretrained models carry a
 > "non-commercial research only" notice. The **default detector is now YuNet**
-> (`face_detection_yunet_2023mar.onnx` from the OpenCV model zoo, Apache-2.0,
+> `face_detection_yunet_2026may.onnx` from the OpenCV model zoo, Apache-2.0,
 > no insightface lineage), which removes this concern entirely; SCRFD remains
 > embedded behind `--detector scrfd` for A/B comparison. All Rust dependencies
 > are permissive (MIT / Apache-2.0); no GPL/AGPL code is linked.
@@ -66,7 +66,7 @@ with `FACEWATCH_MODELS_DIR=/path` when building.
 | Model | Input | Output |
 |---|---|---|
 | `scrfd_10g_bnkps.onnx` (~16 MiB) | `[1,3,640,640]` f32, `(x-127.5)/128`, RGB | 9× rank-2 `[count,…]` (score/bbox/kps, strides 8/16/32) |
-| `face_detection_yunet_2023mar.onnx` (~227 KiB) | `[1,3,640,640]` f32, BGR, raw `[0,255]`, no mean | 12× (cls/obj/bbox/kps, strides 8/16/32) |
+| `face_detection_yunet_2026may.onnx` (~224 KiB) | `[1,3,-1,-1]` f32 dynamic H/W (640 default; any multiple of 32), BGR, raw `[0,255]`, no mean | 12× (cls/obj/bbox/kps, strides 8/16/32) |
 | `glintr100.onnx` (~248 MiB) | `[1,3,112,112]` f32, `(x-127.5)/127.5` (no baked-in Sub/Mul) | `[1,512]` |
 
 **Model integrity.** `build.rs` verifies every model file against the exact
@@ -77,7 +77,7 @@ artifacts:
 
 ```
 scrfd_10g_bnkps.onnx  5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91
-face_detection_yunet_2023mar.onnx  8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
+face_detection_yunet_2026may.onnx  ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0
 glintr100.onnx        a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60
 ```
 
@@ -92,6 +92,10 @@ facewatch register alice photo.jpg
 # Live webcam recognition, published to mediamtx (--frames N stops after N frames)
 facewatch run
 facewatch run --frames 20 --verbose
+
+# Faster detection at lower input resolution (yuNet now uses the dynamic-shape
+# 2026may export, so it accepts 320 too — not just scrfd)
+facewatch run --input-size 320
 
 # ^C stops any live run gracefully between frames (and prints the --profile summary)
 
@@ -108,6 +112,8 @@ facewatch image photo.jpg
 | Flag | Default | Description |
 |---|---|---|
 | `--detector NAME` | `yunet` | Detector backend: `yunet` (OpenCV zoo, default) or `scrfd` |
+| `--threads N` | logical CPUs | ONNX intra-op threads per model session |
+| `--input-size N` | `640` | Detector input size: `320` (faster) or `640`; the dynamic-shape yuNet (2026may) and scrfd both accept any multiple of 32 |
 | `--threshold F` | `0.40` | Minimum cosine similarity for a gallery match |
 | `--gallery PATH` | `~/.facewatch/gallery.json` | Gallery JSON path |
 | `--rtsp URL` | `rtsp://127.0.0.1:8554/facewatch` | Publish the annotated stream to this RTSP URL |

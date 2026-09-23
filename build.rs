@@ -1,6 +1,6 @@
 //! Build-time model provisioning.
 //!
-//! Guarantees that `scrfd_10g_bnkps.onnx`, `face_detection_yunet_2023mar.onnx`,
+//! Guarantees that `scrfd_10g_bnkps.onnx`, `face_detection_yunet_2026may.onnx`,
 //! and `glintr100.onnx` exist in `models/` **before** the crate compiles:
 //! missing, truncated, or tampered files are downloaded and verified against
 //! the exact SHA-256 published for each artifact. The verified files are then
@@ -37,14 +37,15 @@ const MODEL_SPECS: &[ModelSpec] = &[
         size: 16_923_827,
         sha256: "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
     },
-    // OpenCV zoo YuNet (2023mar), kept behind Git LFS in opencv_zoo, so the
-    // raw bytes come from the media host rather than a raw-URL pointer file.
+    // OpenCV zoo YuNet (2026may): the dynamic-shape re-export of the 2023mar
+    // model. Same weights and byte-identical outputs at 640, but the H/W input
+    // dims are symbolic, so `--input-size` 320 (or any multiple of 32) works.
     ModelSpec {
         prefix: "YUNET",
-        name: "face_detection_yunet_2023mar.onnx",
-        url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
-        size: 232_589,
-        sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+        name: "face_detection_yunet_2026may.onnx",
+        url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2026may.onnx",
+        size: 229_738,
+        sha256: "ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0",
     },
     ModelSpec {
         prefix: "AURAFACE",

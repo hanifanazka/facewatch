@@ -1,16 +1,18 @@
-//! YuNet face detector (OpenCV zoo `face_detection_yunet_2023mar.onnx`),
-//! decoded to mirror OpenCV's `FaceDetectorYN` postprocess
-//! (`modules/objdetect/src/face_detect.cpp`), which is the reference consumer
-//! of this model.
+//! YuNet face detector (OpenCV zoo `face_detection_yunet_2026may.onnx`), the
+//! dynamic-shape re-export of the 2023mar model (same weights; outputs at 640
+//! are byte-identical, verified by probe), decoded to mirror OpenCV's
+//! `FaceDetectorYN` postprocess (`modules/objdetect/src/face_detect.cpp`),
+//! which is the reference consumer of this model.
 //!
 //! Contract (verified empirically against the OpenCV reference pipeline):
-//! - one input `input`, fixed `(1, 3, 640, 640)` f32 NCHW, BGR channel order,
-//!   raw pixel values in `[0, 255]` with no mean subtraction; the graph has no
-//!   baked-in normalization, so the blob must be fed exactly like
-//!   `cv::dnn::blobFromImage` defaults do;
+//! - one input `input`, dynamic `(1, 3, H, W)` f32 NCHW (H = W =
+//!   `--input-size`, default 640; the graph is fully convolutional, any
+//!   multiple of 32 works), BGR channel order, raw pixel values in `[0, 255]`
+//!   with no mean subtraction; the graph has no baked-in normalization, so the
+//!   blob must be fed exactly like `cv::dnn::blobFromImage` defaults do;
 //! - 12 outputs, three per stride `s in {8, 16, 32}`:
 //!   `cls_s` / `obj_s` `(1, N, 1)`, `bbox_s` `(1, N, 4)`, `kps_s` `(1, N, 10)`,
-//!   where `N = (640/s)^2` cells;
+//!   where `N = (S/s)^2` cells for input size `S`;
 //! - per-cell decode: `score = sqrt(clamp(cls) * clamp(obj))`; box
 //!   `cx = (c + tx) * s`, `cy = (r + ty) * s`, `w = exp(tw) * s`,
 //!   `h = exp(th) * s`; landmarks the same `(offset + index) * s` form;
@@ -26,10 +28,11 @@ use ndarray::{Array4, IxDyn};
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::face::{Array3U8, DetectedFace, Kps, letterbox, load_session, non_max_suppression, unletterbox};
+use crate::face::{
+    Array3U8, DetectedFace, Kps, ensure_fixed_input_fits, letterbox, load_session,
+    non_max_suppression, unletterbox,
+};
 
-/// YuNet fixed input resolution (square).
-pub const INPUT_SIZE: usize = 640;
 /// Detection confidence threshold (FaceDetectorYN default).
 pub const DET_THRESHOLD: f32 = 0.9;
 /// NMS IoU threshold (FaceDetectorYN default).
@@ -38,7 +41,7 @@ pub const NMS_THRESHOLD: f32 = 0.3;
 const STRIDES: [usize; 3] = [8, 16, 32];
 
 /// Output positions of the 12 per-stride tensors, resolved by name once at
-/// load time (the names are part of the 2023mar export contract).
+/// load time (the names are part of the YuNet export contract).
 #[derive(Clone, Copy)]
 struct OutIdx {
     cls: [usize; 3],
@@ -51,6 +54,7 @@ struct OutIdx {
 pub struct Yunet {
     session: Session,
     input_name: String,
+    input_size: usize,
     out: OutIdx,
     det_thresh: f32,
     nms_thresh: f32,
@@ -58,8 +62,9 @@ pub struct Yunet {
 
 impl Yunet {
     /// Builds a detection session from the embedded model bytes.
-    pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        let session = load_session(model_bytes, "YuNet")?;
+    pub fn load(model_bytes: &[u8], threads: usize, input_size: usize) -> Result<Self> {
+        let session = load_session(model_bytes, "YuNet", threads)?;
+        ensure_fixed_input_fits(&session, input_size, "YuNet")?;
 
         anyhow::ensure!(
             session.outputs().len() == 12,
@@ -97,6 +102,7 @@ impl Yunet {
         Ok(Self {
             session,
             input_name,
+            input_size,
             out,
             det_thresh: DET_THRESHOLD,
             nms_thresh: NMS_THRESHOLD,
@@ -105,11 +111,12 @@ impl Yunet {
 
     /// Runs detection on an RGB frame. Coordinates are in source-frame pixels.
     pub fn detect(&mut self, frame: &Array3U8) -> Result<Vec<DetectedFace>> {
-        let (resized, scale_x, scale_y) = letterbox(frame, INPUT_SIZE);
+        let input_size = self.input_size;
+        let (resized, scale_x, scale_y) = letterbox(frame, input_size);
 
         // BGR channels, raw [0, 255], no mean subtraction (mirrors
         // blobFromImage defaults) — fill channels swapped into NCHW.
-        let mut blob = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
+        let mut blob = Array4::<f32>::zeros((1, 3, input_size, input_size));
         fill_nchw_bgr(&resized, &mut blob);
 
         let tensor = Tensor::from_array(blob)?;
@@ -126,7 +133,7 @@ impl Yunet {
                 let bbox = outputs[self.out.bbox[i]].try_extract_array::<f32>()?;
                 let kps = outputs[self.out.kps[i]].try_extract_array::<f32>()?;
 
-                let cells = INPUT_SIZE / stride;
+                let cells = input_size / stride;
                 for r in 0..cells {
                     for c in 0..cells {
                         let cell = r * cells + c;

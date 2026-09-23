@@ -7,12 +7,10 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::face::{
-    Array3U8, DetectedFace, Kps, fill_nchw, letterbox, load_session, non_max_suppression,
-    unletterbox,
+    Array3U8, DetectedFace, Kps, ensure_fixed_input_fits, fill_nchw, letterbox, load_session,
+    non_max_suppression, unletterbox,
 };
 
-/// SCRFD input resolution (width, height).
-pub const INPUT_SIZE: usize = 640;
 /// Detection confidence threshold, matching insightface defaults.
 pub const DET_THRESHOLD: f32 = 0.5;
 /// NMS IoU threshold, matching insightface defaults.
@@ -25,14 +23,16 @@ const NUM_ANCHORS: usize = 2;
 pub struct Scrfd {
     session: Session,
     input_name: String,
+    input_size: usize,
     det_thresh: f32,
     nms_thresh: f32,
 }
 
 impl Scrfd {
     /// Builds a detection session from the embedded model bytes.
-    pub fn load(model_bytes: &[u8]) -> Result<Self> {
-        let session = load_session(model_bytes, "SCRFD")?;
+    pub fn load(model_bytes: &[u8], threads: usize, input_size: usize) -> Result<Self> {
+        let session = load_session(model_bytes, "SCRFD", threads)?;
+        ensure_fixed_input_fits(&session, input_size, "SCRFD")?;
 
         anyhow::ensure!(session.outputs().len() == 9, "SCRFD model must have 9 outputs (score/bbox/kps)");
 
@@ -40,6 +40,7 @@ impl Scrfd {
         Ok(Self {
             session,
             input_name,
+            input_size,
             det_thresh: DET_THRESHOLD,
             nms_thresh: NMS_THRESHOLD,
         })
@@ -47,10 +48,11 @@ impl Scrfd {
 
     /// Runs detection on an RGB frame. Coordinates are in source-frame pixels.
     pub fn detect(&mut self, frame: &Array3U8) -> Result<Vec<DetectedFace>> {
-        let (resized, scale_x, scale_y) = letterbox(frame, INPUT_SIZE);
+        let input_size = self.input_size;
+        let (resized, scale_x, scale_y) = letterbox(frame, input_size);
 
         // Build the NCHW float blob: (x - 127.5) / 128.0, RGB already.
-        let mut blob = Array4::<f32>::zeros((1, 3, INPUT_SIZE, INPUT_SIZE));
+        let mut blob = Array4::<f32>::zeros((1, 3, input_size, input_size));
         fill_nchw(&resized, 128.0, &mut blob);
 
         let tensor = Tensor::from_array(blob)?;
@@ -67,8 +69,8 @@ impl Scrfd {
                 let bbox_view = outputs[idx + 3].try_extract_array::<f32>()?;
                 let kps_view = outputs[idx + 6].try_extract_array::<f32>()?;
 
-                let height = INPUT_SIZE / stride;
-                let width = INPUT_SIZE / stride;
+                let height = input_size / stride;
+                let width = input_size / stride;
                 let count = height * width * NUM_ANCHORS;
 
                 for a in 0..count {
