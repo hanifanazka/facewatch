@@ -10,6 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Canonical pipeline order of the profiled stages, as they run per frame.
+/// Each chain element is timed individually; `align`/`embed` only run
+/// when a face is detected, and stages that never run are omitted from the
+/// report. Frame acquisition is not a profiled stage — `total` covers the
+/// whole iteration.
+const STAGE_ORDER: [&str; 6] = ["detect", "align", "embed", "draw", "publish", "total"];
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
@@ -65,37 +72,42 @@ pub fn report() -> String {
             return "(no frames profiled)".to_owned();
         }
 
-        let mut stages: BTreeSet<&'static str> = BTreeSet::new();
-        let mut total_all = Duration::ZERO;
+        let mut seen: BTreeSet<&'static str> = BTreeSet::new();
         for frame in frames.iter() {
-            stages.extend(frame.keys().copied());
-            total_all += frame.values().sum::<Duration>();
+            seen.extend(frame.keys().copied());
         }
+        // Wall-clock anchor for the `share` column: the summed `total` stage
+        // across all frames (`total` is recorded every frame).
+        let total_sum: Duration = frames
+            .iter()
+            .map(|f| f.get("total").copied().unwrap_or_default())
+            .sum();
 
         let mut out = format!("profile summary over {} frames:\n", frames.len());
         out += &format!(
             "{:<8} {:>9} {:>9} {:>9} {:>9} {:>7}\n",
             "stage", "mean", "p50", "p90", "max", "share"
         );
-        for stage in stages {
+        for stage in STAGE_ORDER {
+            if !seen.contains(stage) {
+                continue;
+            }
             let mut vals: Vec<Duration> = frames
                 .iter()
                 .filter_map(|f| f.get(stage))
                 .copied()
                 .collect();
             vals.sort_unstable();
-            if vals.is_empty() {
-                continue;
-            }
             let mean = vals.iter().sum::<Duration>() / vals.len() as u32;
             let p50 = vals[vals.len() / 2];
             let p90 = vals[(vals.len() * 9) / 10];
             let max = vals[vals.len() - 1];
             let total = vals.iter().sum::<Duration>();
-            let share = if total_all.is_zero() {
+            // Share of the whole run's wall-clock time (`total` reads 100%).
+            let share = if total_sum.is_zero() {
                 0.0
             } else {
-                total.as_secs_f64() / total_all.as_secs_f64() * 100.0
+                total.as_secs_f64() / total_sum.as_secs_f64() * 100.0
             };
             out += &format!(
                 "{stage:<8} {:>8.1}ms {:>8.1}  {:>8.1}  {:>8.1}  {:>5.1}%\n",

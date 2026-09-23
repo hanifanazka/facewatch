@@ -344,11 +344,12 @@ fn run(
             break Ok(());
         }
 
-        // Frame acquisition. For GStreamer sources the whole synchronous chain
-        // runs inside pull_frame, so its latency lands in the "pull" stage;
-        // for stills the push happens explicitly below.
+        // Frame acquisition. On GStreamer sources the whole synchronous chain
+        // runs inside pull_frame with each element profiled individually; on
+        // stills the push happens explicitly below. Acquisition itself is not
+        // a profiled stage — `total` covers the whole iteration.
         match &source {
-            FrameSource::Gst(runner) => match profile::time("pull", || runner.pull_frame()) {
+            FrameSource::Gst(runner) => match runner.pull_frame() {
                 Ok(Some(_)) => {}
                 Ok(None) => break Ok(()), // end of stream
                 Err(GstreamRunnerError::PullSample(_)) => continue,
