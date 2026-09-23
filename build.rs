@@ -54,6 +54,14 @@ const MODEL_SPECS: &[ModelSpec] = &[
         size: 260_694_151,
         sha256: "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
     },
+    // SFace model from OpenCV zoo (face_recognition_sface_2021dec.onnx)
+    ModelSpec {
+        prefix: "SFACE",
+        name: "face_recognition_sface_2021dec.onnx",
+        url: "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
+        size: 38_696_353,
+        sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+    },
 ];
 
 fn main() -> Result<()> {

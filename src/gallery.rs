@@ -7,12 +7,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::face::{Embedding, Match};
 
+/// Recognition backend used for matching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Recognizer {
+    AuraFace,
+    SFace,
+}
+
 /// One registered subject.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GalleryEntry {
     pub name: String,
-    /// L2-normalized embedding.
-    pub embedding: Vec<f32>,
+    /// AuraFace L2-normalized embedding (512-d).
+    #[serde(alias = "embedding", default)]
+    pub auraface: Vec<f32>,
+    /// SFace L2-normalized embedding (128-d).
+    #[serde(default)]
+    pub sface: Vec<f32>,
+}
+
+impl GalleryEntry {
+    /// Returns the embedding for the given recognizer.
+    pub fn embedding(&self, recognizer: Recognizer) -> &[f32] {
+        match recognizer {
+            Recognizer::AuraFace => &self.auraface,
+            Recognizer::SFace => &self.sface,
+        }
+    }
+
+    /// Checks if the entry has an embedding for the given recognizer.
+    pub fn has_embedding(&self, recognizer: Recognizer) -> bool {
+        !self.embedding(recognizer).is_empty()
+    }
 }
 
 /// The set of known subjects.
@@ -43,11 +70,12 @@ impl Gallery {
         Ok(())
     }
 
-    /// Adds (or replaces) a subject by name.
-    pub fn register(&mut self, name: &str, embedding: Embedding) {
+    /// Adds (or replaces) a subject by name with both embeddings.
+    pub fn register(&mut self, name: &str, auraface: Embedding, sface: Embedding) {
         let entry = GalleryEntry {
             name: name.to_owned(),
-            embedding: embedding.0,
+            auraface: auraface.0,
+            sface: sface.0,
         };
         if let Some(existing) = self.entries.iter_mut().find(|e| e.name == name) {
             *existing = entry;
@@ -66,18 +94,22 @@ impl Gallery {
     }
 
     /// Returns the best gallery match per embedding, or `None` when the best
-    /// similarity is below `threshold`.
+    /// similarity is below `threshold`. Uses the specified recognizer's embedding space.
     pub fn match_faces(
         &self,
         embeddings: &[Embedding],
         threshold: f32,
+        recognizer: Recognizer,
     ) -> Vec<Option<Match>> {
         embeddings
             .iter()
             .map(|emb| {
                 let mut best: Option<(&str, f32)> = None;
                 for entry in &self.entries {
-                    let sim = Self::cosine(&emb.0, &entry.embedding);
+                    if !entry.has_embedding(recognizer) {
+                        continue;
+                    }
+                    let sim = Self::cosine(&emb.0, entry.embedding(recognizer));
                     if best.map(|(_, s)| sim > s).unwrap_or(true) {
                         best = Some((entry.name.as_str(), sim));
                     }

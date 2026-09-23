@@ -9,12 +9,13 @@
 
 include!(concat!(env!("OUT_DIR"), "/model_meta.rs"));
 
-/// The three embedded models as byte slices.
+/// The four embedded models as byte slices.
 #[derive(Debug)]
 pub struct Models {
     pub scrfd: &'static [u8],
     pub yunet: &'static [u8],
     pub auraface: &'static [u8],
+    pub sface: &'static [u8],
 }
 
 impl Models {
@@ -25,6 +26,7 @@ impl Models {
             scrfd: SCRFD_BYTES,
             yunet: YUNET_BYTES,
             auraface: AURAFACE_BYTES,
+            sface: SFACE_BYTES,
         }
     }
 }
@@ -40,5 +42,6 @@ mod tests {
         assert_eq!(SCRFD_BYTES.len(), SCRFD_SIZE);
         assert_eq!(YUNET_BYTES.len(), YUNET_SIZE);
         assert_eq!(AURAFACE_BYTES.len(), AURAFACE_SIZE);
+        assert_eq!(SFACE_BYTES.len(), SFACE_SIZE);
     }
 }

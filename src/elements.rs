@@ -16,10 +16,11 @@ use crate::draw;
 use crate::face::{
     Array3U8, DetectedFace, FaceEmbeddings, FaceFrame, FaceMatches, Rgb, arr3_to_rgb, rgb_to_arr3,
 };
-use crate::gallery::Gallery;
+use crate::gallery::{Gallery, Recognizer};
 use crate::models::Models;
 use crate::profile;
 use crate::scrfd::Scrfd;
+use crate::sface::SFace;
 use crate::yunet::Yunet;
 
 /// Selectable face-detection backend; keeps both ONNX detectors embedded for
@@ -47,6 +48,35 @@ impl Detector {
         match self {
             Detector::Scrfd(d) => d.detect(frame),
             Detector::Yunet(d) => d.detect(frame),
+        }
+    }
+}
+
+/// Selectable face-recognition backend; keeps both ONNX recognizers embedded for
+/// A/B comparison (`--recognizer sface` vs the default `auraface`).
+pub enum Recognizer_ {
+    AuraFace(AuraFace),
+    SFace(SFace),
+}
+
+impl Recognizer_ {
+    /// Loads the requested backend (`"auraface"` or `"sface"`) from
+    /// the embedded model bytes.
+    pub fn load(kind: &str, models: &Models, threads: usize) -> Result<Self> {
+        match kind {
+            "auraface" => Ok(Recognizer_::AuraFace(AuraFace::load(models.auraface, threads)?)),
+            "sface" => Ok(Recognizer_::SFace(SFace::load(models.sface, threads)?)),
+            other => anyhow::bail!(
+                "unknown recognizer {other:?} (expected \"auraface\" or \"sface\")"
+            ),
+        }
+    }
+
+    /// Runs recognition on an aligned RGB crop, delegating to the active backend.
+    pub fn embed(&mut self, crop: &Array3U8) -> Result<crate::face::Embedding> {
+        match self {
+            Recognizer_::AuraFace(a) => a.embed(crop),
+            Recognizer_::SFace(s) => s.embed(crop),
         }
     }
 }
@@ -135,8 +165,8 @@ impl Stage<Array3U8, FaceFrame> {
 pub type RecognitionElement = Stage<FaceFrame, FaceEmbeddings>;
 
 impl Stage<FaceFrame, FaceEmbeddings> {
-    pub fn new(aura: AuraFace) -> Self {
-        let mut aura = aura;
+    pub fn new(recognizer: Recognizer_) -> Self {
+        let mut recognizer = recognizer;
         Stage::from_transform(move |buffer| {
             let frame = buffer
                 .downcast_ref::<FaceFrame>()
@@ -146,7 +176,7 @@ impl Stage<FaceFrame, FaceEmbeddings> {
             for face in &frame.faces {
                 let crop = profile::time("align", || align::norm_crop(&frame.src, &face.kps, 112));
                 let embedding =
-                    profile::time("embed", || aura.embed(&crop)).map_err(|e| e.to_string())?;
+                    profile::time("embed", || recognizer.embed(&crop)).map_err(|e| e.to_string())?;
                 embeddings.push(embedding);
             }
             Ok(Buffer::new(FaceEmbeddings {
@@ -162,7 +192,7 @@ impl Stage<FaceFrame, FaceEmbeddings> {
 pub type MatchElement = Stage<FaceEmbeddings, FaceMatches>;
 
 impl Stage<FaceEmbeddings, FaceMatches> {
-    pub fn new(gallery: Arc<Mutex<Gallery>>, threshold: f32) -> Self {
+    pub fn new(gallery: Arc<Mutex<Gallery>>, threshold: f32, recognizer: Recognizer) -> Self {
         Stage::from_transform(move |buffer| {
             let faces = buffer
                 .downcast_ref::<FaceEmbeddings>()
@@ -171,7 +201,7 @@ impl Stage<FaceEmbeddings, FaceMatches> {
             let matches = gallery
                 .lock()
                 .map_err(|_| "gallery mutex poisoned".to_owned())?
-                .match_faces(&faces.embeddings, threshold);
+                .match_faces(&faces.embeddings, threshold, recognizer);
             Ok(Buffer::new(FaceMatches {
                 src: faces.src.clone(),
                 faces: faces.faces.clone(),
@@ -229,25 +259,31 @@ pub struct Chain {
 
 impl Chain {
     /// Builds the chain from the given models and gallery. `detector` selects
-    /// the detection backend (`"scrfd"` or `"yunet"`), `threads` sets the
-    /// per-session ONNX intra-op thread count, and `input_size` the detector
-    /// input resolution (320 or 640).
+    /// the detection backend (`"scrfd"` or `"yunet"`), `recognizer` selects
+    /// the recognition backend (`"auraface"` default or `"sface"`), `threads`
+    /// sets the per-session ONNX intra-op thread count, and `input_size` the
+    /// detector input resolution (320 or 640).
     pub fn new(
         models: &Models,
         gallery: Arc<Mutex<Gallery>>,
         threshold: f32,
         options: OverlayOptions,
         detector: &str,
+        recognizer: &str,
         threads: usize,
         input_size: usize,
     ) -> Result<Self> {
         let detector = Detector::load(detector, models, threads, input_size)?;
-        let aura = AuraFace::load(models.auraface, threads)?;
+        let recognizer_kind = match recognizer {
+            "sface" => Recognizer::SFace,
+            _ => Recognizer::AuraFace,
+        };
+        let recognizer = Recognizer_::load(recognizer, models, threads)?;
         let (tx, display_rx) = std::sync::mpsc::channel::<Array3U8>();
 
         let detection = DetectionElement::new(detector);
-        let recognition = RecognitionElement::new(aura);
-        let matching = MatchElement::new(gallery, threshold);
+        let recognition = RecognitionElement::new(recognizer);
+        let matching = MatchElement::new(gallery, threshold, recognizer_kind);
         let overlay = OverlaySink::new(options, Some(tx));
 
         link_upstream(&detection, &recognition)?;

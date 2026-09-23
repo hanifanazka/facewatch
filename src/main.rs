@@ -4,6 +4,7 @@
 
 mod align;
 mod aura;
+mod sface;
 mod draw;
 mod elements;
 mod face;
@@ -30,6 +31,7 @@ use crate::gallery::Gallery;
 use crate::models::Models;
 use crate::rtsp::RtspPublisher;
 use crate::scrfd::Scrfd;
+use crate::sface::SFace;
 
 /// Default gallery location: `$HOME/.facewatch/gallery.json`.
 fn default_gallery() -> PathBuf {
@@ -54,6 +56,10 @@ struct Cli {
     /// Face detector backend: "yunet" (default) or "scrfd".
     #[arg(long, default_value = "yunet")]
     detector: String,
+
+    /// Face recognition backend: "auraface" (default) or "sface".
+    #[arg(long, default_value = "auraface")]
+    recognizer: String,
 
     /// ONNX intra-op threads per model session (default: logical CPU count).
     #[arg(long)]
@@ -235,6 +241,7 @@ fn register(
 
     let mut detector = Scrfd::load(models.scrfd, threads, input_size)?;
     let mut aura = AuraFace::load(models.auraface, threads)?;
+    let mut sface = SFace::load(models.sface, threads)?;
 
     let frame = match image {
         Some(path) => load_image_frame(path)?,
@@ -258,10 +265,11 @@ fn register(
             }
         }
     }
-    let embedding = aura.embed(&crop)?;
+    let embedding_aura = aura.embed(&crop)?;
+    let embedding_sface = sface.embed(&crop)?;
 
     let mut gallery = gallery.lock().map_err(|_| anyhow!("gallery mutex poisoned"))?;
-    gallery.register(name, embedding);
+    gallery.register(name, embedding_aura, embedding_sface);
     gallery.save(gallery_path)?;
 
     eprintln!(
@@ -320,6 +328,7 @@ fn run(
         cli.threshold,
         overlay_opts(cli),
         &cli.detector,
+        &cli.recognizer,
         threads,
         cli.input_size,
     )?;
@@ -452,6 +461,7 @@ fn analyze_image(
         cli.threshold,
         overlay_opts(cli),
         &cli.detector,
+        &cli.recognizer,
         threads,
         cli.input_size,
     )?;
