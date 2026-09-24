@@ -141,3 +141,111 @@ impl Gallery {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn e(v: Vec<f32>) -> Embedding {
+        Embedding(v)
+    }
+
+    #[test]
+    fn register_stores_both_embeddings() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 2.0, 3.0]), e(vec![4.0, 5.0, 6.0]));
+
+        let entry = &g.entries[0];
+        assert_eq!(entry.auraface, vec![1.0, 2.0, 3.0]);
+        assert_eq!(entry.sface, vec![4.0, 5.0, 6.0]);
+        assert_eq!(entry.embedding(Recognizer::AuraFace), &[1.0, 2.0, 3.0]);
+        assert_eq!(entry.embedding(Recognizer::SFace), &[4.0, 5.0, 6.0]);
+        assert!(entry.has_embedding(Recognizer::AuraFace));
+        assert!(entry.has_embedding(Recognizer::SFace));
+    }
+
+    #[test]
+    fn register_replaces_existing_entry() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 2.0]), e(vec![3.0, 4.0]));
+        g.register("A", e(vec![5.0, 6.0]), e(vec![7.0, 8.0]));
+
+        assert_eq!(g.entries.len(), 1);
+        assert_eq!(g.entries[0].auraface, vec![5.0, 6.0]);
+        assert_eq!(g.entries[0].sface, vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn match_faces_uses_requested_recognizer_space() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 0.0]), e(vec![0.0, 1.0]));
+        g.register("B", e(vec![0.9, 0.1]), e(vec![0.1, 0.9]));
+
+        let match_a = g.match_faces(&[e(vec![1.0, 0.0])], 0.0, Recognizer::AuraFace)[0].clone().unwrap();
+        assert_eq!(match_a.name, "A");
+        assert_eq!(match_a.score, 1.0);
+
+        let match_s = g.match_faces(&[e(vec![0.0, 1.0])], 0.0, Recognizer::SFace)[0].clone().unwrap();
+        assert_eq!(match_s.name, "A");
+        assert_eq!(match_s.score, 1.0);
+    }
+
+    #[test]
+    fn match_faces_skips_entries_missing_recognizer_space() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 0.0]), e(vec![]));
+        g.register("B", e(vec![0.0, 1.0]), e(vec![1.0, 0.0]));
+
+        let match_s = g.match_faces(&[e(vec![1.0, 0.0])], 0.0, Recognizer::SFace)[0].clone().unwrap();
+        assert_eq!(match_s.name, "B");
+        assert_eq!(match_s.score, 1.0);
+    }
+
+    #[test]
+    fn match_faces_threshold_blocks_match() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 0.0]), e(vec![0.0, 1.0]));
+
+        let matches = g.match_faces(&[e(vec![1.0, 0.0])], 1.1, Recognizer::AuraFace);
+        assert!(matches[0].is_none());
+    }
+
+    #[test]
+    fn legacy_embedding_alias_loads_as_auraface() {
+        let json = r#"{"entries":[{"name":"A","embedding":[1.0, 2.0, 3.0]}]}"#;
+        let g: Gallery = serde_json::from_str(json).unwrap();
+        let entry = &g.entries[0];
+        assert_eq!(entry.auraface, vec![1.0, 2.0, 3.0]);
+        assert!(entry.sface.is_empty());
+        assert_eq!(entry.embedding(Recognizer::AuraFace), &[1.0, 2.0, 3.0]);
+        assert!(!entry.has_embedding(Recognizer::SFace));
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 2.0]), e(vec![3.0, 4.0]));
+        let path = std::env::temp_dir().join(format!("facewatch-test-{}.json", std::process::id()));
+        g.save(&path).unwrap();
+        let loaded = Gallery::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.entries[0].auraface, vec![1.0, 2.0]);
+        assert_eq!(loaded.entries[0].sface, vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn summary_formats_names() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![]), e(vec![]));
+        g.register("B", e(vec![]), e(vec![]));
+        assert_eq!(g.summary(), "A, B");
+        assert_eq!(Gallery::default().summary(), "(empty)");
+    }
+
+    #[test]
+    fn cosine_computes_dot_product() {
+        assert_eq!(Gallery::cosine(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
+        assert_eq!(Gallery::cosine(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+    }
+}
