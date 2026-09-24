@@ -462,3 +462,314 @@ fn draw_face(
     draw::fill_rect(img, x1, label_y, (x1 + tw + 3).min(w - 1), (label_y + 10).min(h - 1), Rgb::BLACK);
     draw::draw_text(img, x1 + 1, label_y + 1, &label, Rgb::WHITE);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::face::Embedding;
+    use pupi::Buffer;
+
+    /// A downstream sink pad that records every buffer it receives.
+    fn capture_sink<T: 'static>() -> (Arc<Mutex<SinkPad>>, Arc<Mutex<Vec<Buffer>>>) {
+        let received: Arc<Mutex<Vec<Buffer>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv = Arc::clone(&received);
+        let pad = Arc::new(Mutex::new(SinkPad::new(
+            Caps {
+                formats: vec![TypeCap::of::<T>()],
+            },
+            |_| Ok(()),
+            move |buffer| {
+                recv.lock().unwrap().push(buffer);
+                Ok(())
+            },
+        )));
+        (pad, received)
+    }
+
+    /// Links a downstream capture sink to `stage`, negotiates, and returns the
+    /// capture.
+    fn link_capture<O: 'static>(
+        stage: &impl Element,
+    ) -> Arc<Mutex<Vec<Buffer>>> {
+        let (sink, received) = capture_sink::<O>();
+        let src = stage
+            .src_pad("src")
+            .expect("stage has a src pad");
+        src.lock().unwrap().link(Arc::clone(&sink));
+        src.lock().unwrap().negotiate();
+        received
+    }
+
+    fn push_to<I>(stage: &impl Element, payload: I) -> Result<(), String>
+    where
+        I: std::any::Any + Send + Sync,
+    {
+        let sink = stage.sink_pad("sink").expect("stage has a sink pad");
+        sink.lock().unwrap().push(Buffer::new(payload))
+    }
+
+    struct Padless;
+
+    impl Element for Padless {
+        fn src_pad(&self, _: &str) -> Option<&Arc<Mutex<SourcePad>>> {
+            None
+        }
+        fn sink_pad(&self, _: &str) -> Option<&Arc<Mutex<SinkPad>>> {
+            None
+        }
+    }
+
+    #[test]
+    fn stage_exposes_only_its_named_pads() {
+        let stage: Stage<u8, ()> = Stage::from_transform(|_| Ok(Buffer::new(())));
+        assert!(stage.src_pad("src").is_some());
+        assert!(stage.sink_pad("sink").is_some());
+        assert!(stage.src_pad("anything-else").is_none());
+        assert!(stage.sink_pad("anything-else").is_none());
+    }
+
+    #[test]
+    fn stage_runs_transform_and_pushes_output_downstream() {
+        let stage: Stage<u32, String> = Stage::from_transform(|b| {
+            let v = b.downcast_ref::<u32>().ok_or("expected u32")?;
+            Ok(Buffer::new(v.to_string()))
+        });
+        let received = link_capture::<String>(&stage);
+        push_to(&stage, 42u32).unwrap();
+        let buf = received.lock().unwrap().pop().expect("one output buffer");
+        assert_eq!(buf.downcast_ref::<String>(), Some(&"42".to_owned()));
+    }
+
+    #[test]
+    fn stage_rejects_wrong_payload_type() {
+        let stage: Stage<u32, ()> = Stage::from_transform(|b| {
+            b.downcast_ref::<u32>().ok_or("expected u32")?;
+            Ok(Buffer::new(()))
+        });
+        let err = push_to(&stage, "not a u32".to_owned()).unwrap_err();
+        assert_eq!(err, "expected u32");
+        // And a transform failure propagates as an Err with its message.
+        let failing: Stage<u8, ()> = Stage::from_transform(|_| Err("boom".to_owned()));
+        let err = push_to(&failing, 1u8).unwrap_err();
+        assert_eq!(err, "boom");
+    }
+
+    #[test]
+    fn match_element_matches_against_gallery() {
+        let mut g = Gallery::default();
+        g.register("A", Embedding(vec![1.0, 0.0]), Embedding(vec![]));
+        g.register("B", Embedding(vec![0.0, 1.0]), Embedding(vec![]));
+        let gallery = Arc::new(Mutex::new(g));
+        let stage = MatchElement::new(Arc::clone(&gallery), 0.5, Recognizer::AuraFace);
+
+        let received = link_capture::<FaceMatches>(&stage);
+        let src = Arc::new(Array3U8::zeros((4, 4, 3)));
+        let payload = FaceEmbeddings {
+            src: Arc::clone(&src),
+            faces: vec![],
+            embeddings: vec![Embedding(vec![1.0, 0.0]), Embedding(vec![0.0, 1.0])],
+        };
+        push_to(&stage, payload).unwrap();
+
+        let buf = received.lock().unwrap().pop().unwrap();
+        let matches = buf.downcast_ref::<FaceMatches>().unwrap();
+        assert_eq!(matches.matches.len(), 2);
+        let a = matches.matches[0].as_ref().unwrap();
+        assert_eq!(a.name, "A");
+        assert_eq!(a.score, 1.0);
+        let b = matches.matches[1].as_ref().unwrap();
+        assert_eq!(b.name, "B");
+    }
+
+    #[test]
+    fn match_element_applies_threshold_and_recognizer_space() {
+        let mut g = Gallery::default();
+        g.register("A", Embedding(vec![1.0, 0.0]), Embedding(vec![0.0, 1.0]));
+        let gallery = Arc::new(Mutex::new(g));
+
+        // Below threshold -> None.
+        let stage = MatchElement::new(Arc::clone(&gallery), 0.95, Recognizer::AuraFace);
+        let received = link_capture::<FaceMatches>(&stage);
+        let src = Arc::new(Array3U8::zeros((4, 4, 3)));
+        let payload = FaceEmbeddings {
+            src,
+            faces: vec![],
+            embeddings: vec![Embedding(vec![0.9, 0.0])], // 0.9 < 0.95
+        };
+        push_to(&stage, payload).unwrap();
+        let buf = received.lock().unwrap().pop().unwrap();
+        let matches = buf.downcast_ref::<FaceMatches>().unwrap();
+        assert!(matches.matches[0].is_none());
+
+        // SFace space: A has sface [0,1], probe [0,1] matches at 1.0.
+        let stage = MatchElement::new(gallery, 0.5, Recognizer::SFace);
+        let received = link_capture::<FaceMatches>(&stage);
+        let payload = FaceEmbeddings {
+            src: Arc::new(Array3U8::zeros((4, 4, 3))),
+            faces: vec![],
+            embeddings: vec![Embedding(vec![0.0, 1.0])],
+        };
+        push_to(&stage, payload).unwrap();
+        let buf = received.lock().unwrap().pop().unwrap();
+        let matches = buf.downcast_ref::<FaceMatches>().unwrap();
+        assert_eq!(matches.matches[0].as_ref().unwrap().name, "A");
+    }
+
+    #[test]
+    fn overlay_sink_emits_annotated_frame_on_the_display_channel() {
+        let (tx, rx) = std::sync::mpsc::channel::<Array3U8>();
+        let stage = OverlaySink::new(
+            OverlayOptions {
+                save_dir: None,
+                save_every: 1,
+                verbose: false,
+            },
+            Some(tx),
+        );
+
+        let src = Array3U8::zeros((8, 8, 3));
+        let payload = FaceMatches {
+            src: Arc::new(src.clone()),
+            faces: vec![DetectedFace {
+                bbox: [1.0, 1.0, 6.0, 6.0],
+                score: 0.9,
+                kps: [[0.0; 2]; 5],
+            }],
+            matches: vec![None],
+        };
+        push_to(&stage, payload).unwrap();
+
+        let out = rx.recv_timeout(Duration::from_secs(5)).expect("annotated frame");
+        assert_eq!(out.shape(), &[8, 8, 3]);
+        let changed = out.iter().zip(src.iter()).filter(|(a, b)| a != b).count();
+        assert!(changed > 0, "the red box must be drawn onto the frame");
+    }
+
+    #[test]
+    fn overlay_sink_saves_every_nth_frame() {
+        let dir = std::env::temp_dir().join(format!("facewatch-overlay-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stage = OverlaySink::new(
+            OverlayOptions {
+                save_dir: Some(dir.clone()),
+                save_every: 2,
+                verbose: false,
+            },
+            None,
+        );
+
+        let payload = || FaceMatches {
+            src: Arc::new(Array3U8::zeros((4, 4, 3))),
+            faces: vec![],
+            matches: vec![],
+        };
+        for _ in 0..3 {
+            push_to(&stage, payload()).unwrap();
+        }
+
+        assert!(dir.join("frame_000002.png").exists(), "frame 2 saved (2 % 2 == 0)");
+        assert!(!dir.join("frame_000001.png").exists());
+        assert!(!dir.join("frame_000003.png").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_upstream_reports_missing_pads() {
+        let err = link_upstream(&Padless, &Padless).unwrap_err();
+        assert!(err.to_string().contains("no src pad"), "{err}");
+    }
+
+    #[test]
+    fn detector_load_rejects_unknown_kind_before_touching_models() {
+        let models = Models {
+            scrfd: &[],
+            yunet: &[],
+            auraface: &[],
+            sface: &[],
+        };
+        let err = Detector::load("bogus", &models, 1, 640)
+            .err()
+            .expect("unknown detector must fail");
+        assert!(err.to_string().contains("unknown detector"), "{err}");
+    }
+
+    #[test]
+    fn recognizer_load_rejects_unknown_kind_before_touching_models() {
+        let models = Models {
+            scrfd: &[],
+            yunet: &[],
+            auraface: &[],
+            sface: &[],
+        };
+        let err = Recognizer_::load("bogus", &models, 1)
+            .err()
+            .expect("unknown recognizer must fail");
+        assert!(err.to_string().contains("unknown recognizer"), "{err}");
+    }
+
+    #[test]
+    fn chain_rejects_unknown_detector() {
+        let models = Models {
+            scrfd: &[],
+            yunet: &[],
+            auraface: &[],
+            sface: &[],
+        };
+        let gallery = Arc::new(Mutex::new(Gallery::default()));
+        let err = Chain::new(
+            &models,
+            gallery,
+            0.4,
+            OverlayOptions {
+                save_dir: None,
+                save_every: 1,
+                verbose: false,
+            },
+            "bogus",
+            "auraface",
+            1,
+            640,
+        )
+        .err()
+        .expect("unknown detector must fail");
+        assert!(err.to_string().contains("unknown detector"), "{err}");
+    }
+
+    #[test]
+    fn chain_end_to_end_with_real_models_pushes_annotated_frames() {
+        // Heavy: loads the embedded ONNX models (both recognizer and detector
+        // pairs); serialized via MODEL_LOCK.
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let models = Models::embedded();
+        let gallery = Arc::new(Mutex::new(Gallery::default()));
+        let opts = OverlayOptions {
+            save_dir: None,
+            save_every: 1,
+            verbose: false,
+        };
+
+        // yunet + auraface
+        let chain = Chain::new(&models, Arc::clone(&gallery), 0.4, opts.clone(), "yunet", "auraface", 1, 640)
+            .expect("yunet+auraface chain loads");
+        let frame = Array3U8::from_shape_fn((480, 640, 3), |_| 100u8);
+        chain.push_frame(frame.clone()).expect("frame accepted");
+        let out = chain
+            .display_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("annotated frame arrives");
+        assert_eq!(out.shape(), &[480, 640, 3]);
+        drop(chain);
+
+        // scrfd + sface
+        let chain = Chain::new(&models, gallery, 0.4, opts, "scrfd", "sface", 1, 640)
+            .expect("scrfd+sface chain loads");
+        chain.push_frame(frame).expect("frame accepted");
+        let out = chain
+            .display_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("annotated frame arrives");
+        assert_eq!(out.shape(), &[480, 640, 3]);
+    }
+}

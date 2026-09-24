@@ -29,6 +29,14 @@ pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Turns profiling off and drops any recorded frames (used by tests to keep
+/// the global flag isolated; harmless when profiling was already off).
+pub fn disable() {
+    ENABLED.store(false, Ordering::Relaxed);
+    FRAMES.with(|frames| frames.borrow_mut().clear());
+    CUR.with(|cur| cur.borrow_mut().clear());
+}
+
 /// Adds `d` to stage `stage` of the current frame.
 pub fn record(stage: &'static str, d: Duration) {
     if !ENABLED.load(Ordering::Relaxed) {
@@ -120,4 +128,144 @@ pub fn report() -> String {
         }
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `ENABLED` is process-global while `FRAMES`/`CUR` are thread-local, so
+    // tests that touch the flag serialize on this lock to avoid stepping on
+    // each other when running in parallel threads.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn disabled_is_a_noop_and_reports_no_frames() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        assert_eq!(time("detect", || 7), 7);
+        record("detect", ms(5));
+        frame_done();
+        assert!(report().contains("(no frames profiled)"));
+    }
+
+    #[test]
+    fn records_accumulate_within_a_frame() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("detect", ms(1));
+        record("detect", ms(2));
+        frame_done();
+        let text = report();
+        assert!(text.contains("profile summary over 1 frames"));
+        assert!(text.contains("3.0ms"), "detect mean is the sum of both records: {text}");
+        disable();
+    }
+
+    #[test]
+    fn frame_done_starts_a_new_frame() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("detect", ms(4));
+        frame_done();
+        record("detect", ms(2));
+        frame_done();
+        let text = report();
+        assert!(text.contains("profile summary over 2 frames"));
+        assert!(text.contains("3.0ms"), "detect mean is 3.0ms across two frames: {text}");
+        disable();
+    }
+
+    #[test]
+    fn empty_frames_are_not_pushed() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        frame_done(); // nothing recorded yet
+        assert!(report().contains("(no frames profiled)"));
+        disable();
+    }
+
+    #[test]
+    fn report_computes_mean_p50_p90_max() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        // One sample per frame: [1, 1, 10] -> mean 4.0, p50 1.0, p90 10.0,
+        // max 10.0.
+        record("detect", ms(1));
+        frame_done();
+        record("detect", ms(1));
+        frame_done();
+        record("detect", ms(10));
+        frame_done();
+        let text = report();
+        assert!(text.contains("4.0ms"), "{text}");
+        assert!(text.contains("1.0"), "{text}");
+        assert!(text.contains("10.0"), "{text}");
+        disable();
+    }
+
+    #[test]
+    fn report_lists_stages_in_canonical_order_and_only_seen_ones() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("embed", ms(1));
+        record("total", ms(2));
+        frame_done();
+        let text = report();
+        let embed = text.find("embed").expect("embed stage present");
+        let total = text.find("total").expect("total stage present");
+        assert!(embed < total);
+        assert!(!text.contains("detect"), "unseen stage omitted:\n{text}");
+        assert!(!text.contains("align"), "unseen stage omitted:\n{text}");
+        disable();
+    }
+
+    #[test]
+    fn total_reports_full_share_and_other_stages_proportional() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("detect", ms(10));
+        record("publish", ms(30));
+        record("total", ms(40));
+        frame_done();
+        let text = report();
+        assert!(text.contains("100.0%"), "total share is 100%:\n{text}");
+        assert!(text.contains("25.0%"), "detect share 10/40:\n{text}");
+        assert!(text.contains("75.0%"), "publish share 30/40:\n{text}");
+        disable();
+    }
+
+    #[test]
+    fn zero_total_sum_does_not_divide_by_zero() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("detect", ms(5));
+        frame_done();
+        let text = report();
+        assert!(text.contains("0.0%"), "share guards zero total:\n{text}");
+        disable();
+    }
+
+    #[test]
+    fn disable_drops_all_recorded_frames() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        disable();
+        enable();
+        record("detect", ms(1));
+        frame_done();
+        assert!(!report().contains("(no frames profiled)"));
+        disable();
+        assert!(report().contains("(no frames profiled)"));
+    }
 }

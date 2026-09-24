@@ -68,3 +68,50 @@ impl AuraFace {
         Ok(Embedding(values))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Models;
+
+    #[test]
+    fn input_size_is_square_112() {
+        assert_eq!(INPUT_SIZE, 112);
+    }
+
+    #[test]
+    fn load_rejects_garbage_bytes() {
+        assert!(AuraFace::load(b"this is not an onnx model", 1).is_err());
+        assert!(AuraFace::load(b"", 1).is_err());
+    }
+
+    #[test]
+    fn real_model_embeds_are_512d_l2_normalized_and_deterministic() {
+        // Heavy: loads the embedded 248 MiB model; serialized via MODEL_LOCK
+        // so parallel test threads don't multiply session memory.
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut aura = AuraFace::load(Models::embedded().auraface, 1).expect("model loads");
+
+        let crop = Array3U8::from_shape_fn((INPUT_SIZE, INPUT_SIZE, 3), |(y, x, _)| {
+            ((y * 31 + x * 7) % 256) as u8
+        });
+        let a = aura.embed(&crop).expect("embed blank crop");
+        assert_eq!(a.0.len(), 512);
+
+        let norm: f32 = a.0.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "L2-normalized, got norm {norm}");
+
+        let b = aura.embed(&crop).expect("embed again");
+        let cos: f32 = a.0.iter().zip(&b.0).map(|(x, y)| x * y).sum();
+        assert!(cos > 0.9999, "deterministic embedding, cosine {cos}");
+    }
+
+    #[test]
+    fn real_model_rejects_off_shape_crop() {
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut aura = AuraFace::load(Models::embedded().auraface, 1).expect("model loads");
+        let crop = Array3U8::zeros((64, 64, 3));
+        let err = aura.embed(&crop).unwrap_err();
+        assert!(err.to_string().contains("112x112x3"), "{err}");
+    }
+}

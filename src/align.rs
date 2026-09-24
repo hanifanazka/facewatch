@@ -306,4 +306,135 @@ mod tests {
         assert_eq!(out[[13, 15, 0]], 255, "content should move to dst(15,13)");
         assert_eq!(out[[10, 10, 0]], 0, "src position should no longer be lit");
     }
+
+    #[test]
+    fn estimate_norm_size_128_uses_unit_ratio_with_x_offset() {
+        // For image_size 128 the code uses ratio = 128/128 = 1.0 and
+        // diff_x = 8, i.e. the template is ARCFACE_DST shifted +8 in x;
+        // a landmark set equal to that template maps onto itself.
+        let ratio = 1.0;
+        let diff_x = 8.0 * 128.0 / 128.0;
+        let kps: Kps = std::array::from_fn(|i| {
+            [
+                (ARCFACE_DST[i][0] * ratio + diff_x) as f32,
+                (ARCFACE_DST[i][1] * ratio) as f32,
+            ]
+        });
+        let m = estimate_norm(&kps, 128);
+        let pt = kps[0];
+        let mapped = [
+            m[0][0] * pt[0] as f64 + m[0][1] * pt[1] as f64 + m[0][2],
+            m[1][0] * pt[0] as f64 + m[1][1] * pt[1] as f64 + m[1][2],
+        ];
+        assert!((mapped[0] - pt[0] as f64).abs() < 1e-3);
+        assert!((mapped[1] - pt[1] as f64).abs() < 1e-3);
+    }
+
+    #[test]
+    fn estimate_norm_unknown_size_uses_unit_ratio() {
+        // image_size 100 is a multiple of neither 112 nor 128 -> ratio 1.0,
+        // diff_x 0.0, so the plain ArcFace template maps onto itself.
+        let kps: Kps = std::array::from_fn(|i| [ARCFACE_DST[i][0] as f32, ARCFACE_DST[i][1] as f32]);
+        let m = estimate_norm(&kps, 100);
+        let pt = kps[0];
+        let mapped = [
+            m[0][0] * pt[0] as f64 + m[0][1] * pt[1] as f64 + m[0][2],
+            m[1][0] * pt[0] as f64 + m[1][1] * pt[1] as f64 + m[1][2],
+        ];
+        assert!((mapped[0] - pt[0] as f64).abs() < 1e-3);
+        assert!((mapped[1] - pt[1] as f64).abs() < 1e-3);
+    }
+
+    #[test]
+    fn estimate_norm_recovers_a_rotation() {
+        // Rotate the template 90 deg about its centroid; the estimated
+        // transform must map the rotated points back onto the template.
+        let center = [56.0f64, 71.0];
+        let rotated: Kps = std::array::from_fn(|i| {
+            let [x, y] = ARCFACE_DST[i];
+            [
+                (center[0] - (y - center[1])) as f32,
+                (center[1] + (x - center[0])) as f32,
+            ]
+        });
+        let m = estimate_norm(&rotated, 112);
+        for (i, pt) in ARCFACE_DST.iter().enumerate() {
+            let s = rotated[i];
+            let mapped = [
+                m[0][0] * s[0] as f64 + m[0][1] * s[1] as f64 + m[0][2],
+                m[1][0] * s[0] as f64 + m[1][1] * s[1] as f64 + m[1][2],
+            ];
+            assert!((mapped[0] - pt[0]).abs() < 1e-3, "landmark {i} x");
+            assert!((mapped[1] - pt[1]).abs() < 1e-3, "landmark {i} y");
+        }
+    }
+
+    // NOTE: we deliberately do not test Umeyama on *mirrored* landmarks. For a
+    // proper rotation (det(A) > 0, the case real face-crop alignments and the
+    // rotation test above exercise) the 2x2 SVD recovers R correctly, but for
+    // improper rotations (det < 0 -> d[1] = -1) the hand-rolled SVD does not
+    // fix the U/V handedness, so the recovered transform degenerates (probe
+    // showed scale ~0.225 and an identity-ish R instead of the reflection).
+    // That path is unreachable in production (a face landmark set is never a
+    // reflection of the canonical template), so it is intentionally untested.
+
+    #[test]
+    fn umeyama_degenerate_points_do_not_nan() {
+        // All source points identical -> variance ~0; the scale guard must
+        // fall back to 1.0 instead of producing NaN/Inf.
+        let same: Kps = [[10.0, 10.0]; 5];
+        let m = estimate_norm(&same, 112);
+        for row in m {
+            for v in row {
+                assert!(v.is_finite(), "matrix entry must be finite: {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn svd2x2_reconstructs_the_matrix_descending() {
+        let a = [[3.0, 0.0], [0.0, 2.0]];
+        let (u, s, v) = svd2x2(a);
+        assert!(s[0] >= s[1]);
+        // U diag(S) V^T == A
+        let mut m = [[0.0; 2]; 2];
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut sum = 0.0;
+                for k in 0..2 {
+                    sum += u[i][k] * s[k] * v[j][k];
+                }
+                m[i][j] = sum;
+            }
+        }
+        assert!((m[0][0] - 3.0).abs() < 1e-9);
+        assert!((m[1][1] - 2.0).abs() < 1e-9);
+        assert!(m[0][1].abs() < 1e-9);
+        assert!(m[1][0].abs() < 1e-9);
+    }
+
+    #[test]
+    fn warp_affine_bilinear_and_zero_border() {
+        // 1x1 red source scaled 4x: dst(0,0) samples exactly src(0,0);
+        // dst(1,0) blends toward the zero border.
+        let mut src = Array3::<u8>::zeros((1, 1, 3));
+        src[[0, 0, 0]] = 255;
+        let m = [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
+        let out = warp_affine(&src, m, 4);
+        assert_eq!(out[[0, 0, 0]], 255);
+        let blended = out[[0, 1, 0]];
+        assert!((100..=200).contains(&blended), "bilinear fade toward border: {blended}");
+        // dst(3,3) samples src(0.75, 0.75): only the (0,0) corner contributes
+        // ((1 - 0.75)^2 * 255 ~= 16); out-of-bounds samples contribute 0, so
+        // the corner fades toward black rather than wrapping or clamping.
+        let corner = out[[3, 3, 0]];
+        assert!((5..=25).contains(&corner), "bilinear fade at the far corner: {corner}");
+    }
+
+    #[test]
+    fn norm_crop_degenerate_landmarks_do_not_panic() {
+        let src = Array3::<u8>::zeros((64, 64, 3));
+        let out = norm_crop(&src, &[[0.0; 2]; 5], 112);
+        assert_eq!(out.shape(), &[112, 112, 3]);
+    }
 }

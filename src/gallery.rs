@@ -247,5 +247,62 @@ mod tests {
     fn cosine_computes_dot_product() {
         assert_eq!(Gallery::cosine(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
         assert_eq!(Gallery::cosine(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        // Unequal lengths zip-truncate; empty vectors give zero.
+        assert_eq!(Gallery::cosine(&[1.0, 2.0], &[3.0]), 3.0);
+        assert_eq!(Gallery::cosine(&[], &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn match_faces_on_empty_gallery_is_all_none() {
+        let matches = Gallery::default().match_faces(
+            &[e(vec![1.0, 0.0]), e(vec![0.0, 1.0])],
+            0.0,
+            Recognizer::AuraFace,
+        );
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn match_faces_accepts_score_exactly_at_threshold() {
+        let mut g = Gallery::default();
+        g.register("A", e(vec![1.0, 0.0]), e(vec![]));
+        let matches = g.match_faces(&[e(vec![1.0, 0.0])], 1.0, Recognizer::AuraFace);
+        let m = matches[0].as_ref().unwrap();
+        assert_eq!(m.name, "A");
+        assert_eq!(m.score, 1.0);
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty_gallery() {
+        let path = std::env::temp_dir().join(format!(
+            "facewatch-test-missing-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let g = Gallery::load(&path).unwrap();
+        assert!(g.entries.is_empty());
+    }
+
+    #[test]
+    fn load_ignores_unknown_json_fields() {
+        let json = r#"{"entries":[{"name":"A","embedding":[1.0],"future_field":true}]}"#;
+        let g: Gallery = serde_json::from_str(json).unwrap();
+        assert_eq!(g.entries[0].name, "A");
+    }
+
+    #[test]
+    fn recognizer_serializes_kebab_case_and_roundtrips() {
+        assert_eq!(serde_json::to_string(&Recognizer::AuraFace).unwrap(), r#""aura-face""#);
+        assert_eq!(serde_json::to_string(&Recognizer::SFace).unwrap(), r#""s-face""#);
+        let roundtrip: Recognizer = serde_json::from_str(r#""aura-face""#).unwrap();
+        assert_eq!(roundtrip, Recognizer::AuraFace);
+    }
+
+    #[test]
+    fn summary_single_entry() {
+        let mut g = Gallery::default();
+        g.register("Solo", e(vec![]), e(vec![]));
+        assert_eq!(g.summary(), "Solo");
     }
 }

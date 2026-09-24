@@ -24,7 +24,7 @@
 //!   `FaceDetectorYN` defaults.
 
 use anyhow::{Context, Result};
-use ndarray::{Array4, IxDyn};
+use ndarray::{Array4, ArrayViewD, IxDyn};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -132,57 +132,15 @@ impl Yunet {
                 let obj = outputs[self.out.obj[i]].try_extract_array::<f32>()?;
                 let bbox = outputs[self.out.bbox[i]].try_extract_array::<f32>()?;
                 let kps = outputs[self.out.kps[i]].try_extract_array::<f32>()?;
-
-                let cells = input_size / stride;
-                for r in 0..cells {
-                    for c in 0..cells {
-                        let cell = r * cells + c;
-                        let cls_score = cls
-                            .get(IxDyn(&[0, cell, 0]))
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0);
-                        let obj_score = obj
-                            .get(IxDyn(&[0, cell, 0]))
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0);
-                        let score = (cls_score * obj_score).sqrt();
-                        if score < self.det_thresh {
-                            continue;
-                        }
-
-                        let stride_f = stride as f32;
-                        let tx = bbox.get(IxDyn(&[0, cell, 0])).copied().unwrap_or(0.0);
-                        let ty = bbox.get(IxDyn(&[0, cell, 1])).copied().unwrap_or(0.0);
-                        let tw = bbox.get(IxDyn(&[0, cell, 2])).copied().unwrap_or(0.0);
-                        let th = bbox.get(IxDyn(&[0, cell, 3])).copied().unwrap_or(0.0);
-
-                        let cx = (c as f32 + tx) * stride_f;
-                        let cy = (r as f32 + ty) * stride_f;
-                        let w = tw.exp() * stride_f;
-                        let h = th.exp() * stride_f;
-                        let x1 = cx - w / 2.0;
-                        let y1 = cy - h / 2.0;
-                        let x2 = cx + w / 2.0;
-                        let y2 = cy + h / 2.0;
-
-                        // Identical offset+scale decode per landmark; order is
-                        // kept as-is (see module docs: no remap needed).
-                        let mut landmarks = [[0.0f32; 2]; 5];
-                        for k in 0..5 {
-                            let px =
-                                (c as f32 + kps.get(IxDyn(&[0, cell, k * 2])).copied().unwrap_or(0.0))
-                                    * stride_f;
-                            let py =
-                                (r as f32 + kps.get(IxDyn(&[0, cell, k * 2 + 1])).copied().unwrap_or(0.0))
-                                    * stride_f;
-                            landmarks[k] = [px, py];
-                        }
-
-                        scores_all.push((score, [x1, y1, x2, y2], landmarks));
-                    }
-                }
+                scores_all.extend(decode_yunet_stride(
+                    input_size,
+                    self.det_thresh,
+                    stride,
+                    &cls,
+                    &obj,
+                    &bbox,
+                    &kps,
+                ));
             }
             scores_all
         };
@@ -192,6 +150,71 @@ impl Yunet {
 
         Ok(non_max_suppression(scores_all, self.nms_thresh))
     }
+}
+
+/// Decodes the cls/obj/bbox/kps tensors of one YuNet stride into candidate
+/// detections at letterbox scale: `score = sqrt(clamp(cls) * clamp(obj))`,
+/// box `(c + t) * stride` with `exp`-width, landmarks the same offset+scale
+/// form. Pure (no session), mirroring OpenCV `FaceDetectorYN` postprocess.
+fn decode_yunet_stride(
+    input_size: usize,
+    det_thresh: f32,
+    stride: usize,
+    cls: &ArrayViewD<f32>,
+    obj: &ArrayViewD<f32>,
+    bbox: &ArrayViewD<f32>,
+    kps: &ArrayViewD<f32>,
+) -> Vec<(f32, [f32; 4], Kps)> {
+    let cells = input_size / stride;
+    let mut dets = Vec::new();
+    for r in 0..cells {
+        for c in 0..cells {
+            let cell = r * cells + c;
+            let cls_score = cls
+                .get(IxDyn(&[0, cell, 0]))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let obj_score = obj
+                .get(IxDyn(&[0, cell, 0]))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let score = (cls_score * obj_score).sqrt();
+            if score < det_thresh {
+                continue;
+            }
+
+            let stride_f = stride as f32;
+            let tx = bbox.get(IxDyn(&[0, cell, 0])).copied().unwrap_or(0.0);
+            let ty = bbox.get(IxDyn(&[0, cell, 1])).copied().unwrap_or(0.0);
+            let tw = bbox.get(IxDyn(&[0, cell, 2])).copied().unwrap_or(0.0);
+            let th = bbox.get(IxDyn(&[0, cell, 3])).copied().unwrap_or(0.0);
+
+            let cx = (c as f32 + tx) * stride_f;
+            let cy = (r as f32 + ty) * stride_f;
+            let w = tw.exp() * stride_f;
+            let h = th.exp() * stride_f;
+            let x1 = cx - w / 2.0;
+            let y1 = cy - h / 2.0;
+            let x2 = cx + w / 2.0;
+            let y2 = cy + h / 2.0;
+
+            // Identical offset+scale decode per landmark; order is kept
+            // as-is (see module docs: no remap needed).
+            let mut landmarks = [[0.0f32; 2]; 5];
+            for k in 0..5 {
+                let px = (c as f32 + kps.get(IxDyn(&[0, cell, k * 2])).copied().unwrap_or(0.0))
+                    * stride_f;
+                let py = (r as f32 + kps.get(IxDyn(&[0, cell, k * 2 + 1])).copied().unwrap_or(0.0))
+                    * stride_f;
+                landmarks[k] = [px, py];
+            }
+
+            dets.push((score, [x1, y1, x2, y2], landmarks));
+        }
+    }
+    dets
 }
 
 /// Copies an RGB frame into the top-left of a zero-initialized `NCHW` float
@@ -204,6 +227,126 @@ fn fill_nchw_bgr(frame: &Array3U8, out: &mut Array4<f32>) {
             out[[0, 0, y, x]] = frame[[y, x, 2]] as f32;
             out[[0, 1, y, x]] = frame[[y, x, 1]] as f32;
             out[[0, 2, y, x]] = frame[[y, x, 0]] as f32;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Models;
+    use ndarray::ArrayD;
+
+    #[test]
+    fn thresholds_match_facedetectoryn_defaults() {
+        assert_eq!(DET_THRESHOLD, 0.9);
+        assert_eq!(NMS_THRESHOLD, 0.3);
+        assert_eq!(STRIDES, [8, 16, 32]);
+    }
+
+    #[test]
+    fn fill_nchw_bgr_swaps_channels_without_normalizing() {
+        // RGB pixel (r, g, b) must land in BGR order: channel 0 = b, 1 = g, 2 = r.
+        let mut frame = Array3U8::zeros((1, 1, 3));
+        frame[[0, 0, 0]] = 10; // r
+        frame[[0, 0, 1]] = 20; // g
+        frame[[0, 0, 2]] = 30; // b
+        let mut out = Array4::<f32>::zeros((1, 3, 4, 4));
+        fill_nchw_bgr(&frame, &mut out);
+        assert_eq!(out[[0, 0, 0, 0]], 30.0, "channel 0 is B");
+        assert_eq!(out[[0, 1, 0, 0]], 20.0, "channel 1 is G");
+        assert_eq!(out[[0, 2, 0, 0]], 10.0, "channel 2 is R");
+        // Raw [0,255] values: no mean subtraction, no scaling.
+        assert_eq!(out[[0, 0, 0, 0]], 30.0);
+        // Rest of the blob stays zero.
+        assert_eq!(out[[0, 0, 1, 0]], 0.0);
+    }
+
+    #[test]
+    fn load_rejects_garbage_bytes() {
+        assert!(Yunet::load(b"this is not an onnx model", 1, 640).is_err());
+    }
+
+    /// Builds synthetic cls/obj/bbox/kps tensors for one stride, with a single
+    /// candidate encoded at row `r`, column `c` of the stride grid.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn synthetic_outputs(
+        input_size: usize,
+        stride: usize,
+        r: usize,
+        c: usize,
+        cls: f32,
+        obj: f32,
+        b: [f32; 4],
+        k: [f32; 10],
+    ) -> (ArrayD<f32>, ArrayD<f32>, ArrayD<f32>, ArrayD<f32>) {
+        let cells = input_size / stride;
+        let cell = r * cells + c;
+        let mut cls_a = ArrayD::<f32>::zeros(vec![1, cells * cells, 1]);
+        let mut obj_a = ArrayD::<f32>::zeros(vec![1, cells * cells, 1]);
+        let mut bbox_a = ArrayD::<f32>::zeros(vec![1, cells * cells, 4]);
+        let mut kps_a = ArrayD::<f32>::zeros(vec![1, cells * cells, 10]);
+        cls_a[[0, cell, 0]] = cls;
+        obj_a[[0, cell, 0]] = obj;
+        for (i, v) in b.iter().enumerate() {
+            bbox_a[[0, cell, i]] = *v;
+        }
+        for (i, v) in k.iter().enumerate() {
+            kps_a[[0, cell, i]] = *v;
+        }
+        (cls_a, obj_a, bbox_a, kps_a)
+    }
+
+    #[test]
+    fn decode_maps_one_cell_to_expected_box_and_kps() {
+        // input 64, stride 16 -> 4x4 grid; cell r=1, c=2 -> cell 6.
+        // cls 0.81 * obj 1.0 -> score 0.9.
+        let (cls, obj, bbox, kps) = synthetic_outputs(
+            64,
+            16,
+            1,
+            2,
+            0.81,
+            1.0,
+            [0.5, -0.25, 0.0, f32::ln(2.0)],
+            [0.25, -0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let out = decode_yunet_stride(64, 0.5, 16, &cls.view(), &obj.view(), &bbox.view(), &kps.view());
+        assert_eq!(out.len(), 1);
+        let (s, box_, landmarks) = out[0];
+        assert!((s - 0.9).abs() < 1e-6, "sqrt(0.81*1.0) = 0.9, got {s}");
+        // cx = (2+0.5)*16 = 40; cy = (1-0.25)*16 = 12; w = exp(0)*16 = 16; h = exp(ln2)*16 = 32.
+        assert_eq!(box_, [32.0, -4.0, 48.0, 28.0]);
+        // kps[0] = ((2 + 0.25)*16, (1 - 0.125)*16) = (36, 14).
+        assert_eq!(landmarks[0], [36.0, 14.0]);
+    }
+
+    #[test]
+    fn decode_clamps_scores_and_applies_threshold() {
+        // cls/obj beyond [0,1] clamp to 1.0; 1.5 * 1.5 -> 1.0 -> score 1.0.
+        let (cls, obj, bbox, kps) = synthetic_outputs(64, 16, 0, 0, 1.5, 1.5, [0.0; 4], [0.0; 10]);
+        let out = decode_yunet_stride(64, 0.9, 16, &cls.view(), &obj.view(), &bbox.view(), &kps.view());
+        assert_eq!(out[0].0, 1.0);
+
+        // 0.85^2 sqrt = 0.85 < 0.9 -> skipped.
+        let (cls, obj, bbox, kps) = synthetic_outputs(64, 16, 0, 0, 0.85, 0.85, [0.0; 4], [0.0; 10]);
+        let out = decode_yunet_stride(64, 0.9, 16, &cls.view(), &obj.view(), &bbox.view(), &kps.view());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn real_model_loads_at_320_and_640_and_detects_without_panic() {
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let models = Models::embedded();
+        for size in [320, 640] {
+            let mut det = Yunet::load(models.yunet, 1, size).expect("yunet loads at dynamic size");
+            let frame = Array3U8::from_shape_fn((360, size, 3), |(_, _, _)| 90u8);
+            let faces = det.detect(&frame).expect("detect runs");
+            for f in &faces {
+                assert!(f.bbox.iter().all(|v| v.is_finite()), "finite box: {:?}", f.bbox);
+                assert!(f.kps.iter().all(|p| p.iter().all(|v| v.is_finite())));
+                assert!((0.0..=1.0).contains(&f.score));
+            }
         }
     }
 }

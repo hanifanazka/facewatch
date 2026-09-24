@@ -207,6 +207,13 @@ pub fn draw_text(img: &mut RgbImage, x: i32, y: i32, text: &str, c: FaceRgb) {
 mod tests {
     use super::*;
 
+    fn white() -> Rgb<u8> {
+        Rgb([255, 255, 255])
+    }
+    fn red() -> Rgb<u8> {
+        Rgb([255, 0, 0])
+    }
+
     #[test]
     fn renders_a_known_glyph() {
         // 'A' = 0x7E 0x11 0x11 0x11 0x7E; bit 6 is the top row.
@@ -222,5 +229,99 @@ mod tests {
         assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255]);
         assert_eq!(img.get_pixel(0, 5).0, [255, 255, 255]);
         assert_eq!(img.get_pixel(0, 6).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn set_pixel_ignores_out_of_bounds() {
+        let mut img = RgbImage::new(10, 10);
+        set_pixel(&mut img, -5, -5, red());
+        set_pixel(&mut img, 10, 10, red());
+        set_pixel(&mut img, 9, 9, white());
+        assert_eq!(img.get_pixel(9, 9).0, [255, 255, 255]);
+        // Image untouched elsewhere stays black.
+        assert_eq!(img.get_pixel(5, 5).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn draw_rect_paints_outline_only() {
+        let mut img = RgbImage::new(20, 20);
+        draw_rect(&mut img, 2, 2, 7, 7, FaceRgb::RED, 1);
+        assert_eq!(img.get_pixel(2, 2).0, [255, 64, 64]); // corner
+        assert_eq!(img.get_pixel(7, 7).0, [255, 64, 64]);
+        assert_eq!(img.get_pixel(2, 5).0, [255, 64, 64]); // left edge
+        assert_eq!(img.get_pixel(5, 2).0, [255, 64, 64]); // top edge
+        assert_eq!(img.get_pixel(4, 4).0, [0, 0, 0]); // interior untouched
+    }
+
+    #[test]
+    fn draw_rect_thickness_widens_the_band() {
+        let mut img = RgbImage::new(20, 20);
+        draw_rect(&mut img, 2, 2, 8, 8, FaceRgb::RED, 2);
+        // Inner stroke ring painted (thickness >= 2).
+        assert_eq!(img.get_pixel(3, 3).0, [255, 64, 64]);
+        // Deep interior (5,5) of the 2..8 box stays clean.
+        assert_eq!(img.get_pixel(5, 5).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn fill_rect_paints_including_inverted_coords() {
+        let mut img = RgbImage::new(20, 20);
+        fill_rect(&mut img, 3, 3, 6, 6, FaceRgb::GREEN);
+        fill_rect(&mut img, 12, 12, 10, 10, FaceRgb::WHITE); // inverted
+        assert_eq!(img.get_pixel(3, 3).0, [64, 255, 64]);
+        assert_eq!(img.get_pixel(6, 6).0, [64, 255, 64]);
+        assert_eq!(img.get_pixel(2, 2).0, [0, 0, 0]);
+        assert_eq!(img.get_pixel(10, 10).0, [255, 255, 255]);
+        assert_eq!(img.get_pixel(12, 12).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn draw_line_renders_diagonal_horizontal_and_point() {
+        let mut img = RgbImage::new(10, 10);
+        draw_line(&mut img, 0, 0, 4, 4, FaceRgb::RED);
+        for i in 0..=4 {
+            assert_eq!(img.get_pixel(i, i).0, [255, 64, 64]);
+        }
+        draw_line(&mut img, 0, 8, 6, 8, FaceRgb::GREEN);
+        for x in 0..=6 {
+            assert_eq!(img.get_pixel(x, 8).0, [64, 255, 64]);
+        }
+        draw_line(&mut img, 9, 0, 9, 0, FaceRgb::WHITE);
+        assert_eq!(img.get_pixel(9, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn draw_kps_marks_crosses_at_each_landmark() {
+        let mut img = RgbImage::new(30, 30);
+        let kps: Kps = [[10.0, 10.0], [20.0, 10.0], [15.0, 18.0], [10.0, 24.0], [20.0, 24.0]];
+        draw_kps(&mut img, &kps, FaceRgb::RED, 2);
+        assert_eq!(img.get_pixel(8, 10).0, [255, 64, 64]);
+        assert_eq!(img.get_pixel(10, 8).0, [255, 64, 64]);
+        assert_eq!(img.get_pixel(10, 12).0, [255, 64, 64]);
+        assert_eq!(img.get_pixel(20, 10).0, [255, 64, 64]); // second landmark
+        assert_eq!(img.get_pixel(5, 5).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn text_width_counts_chars_not_bytes() {
+        assert_eq!(text_width("abc"), 18);
+        assert_eq!(text_width(""), 0);
+        assert_eq!(text_width("éx"), 12); // é is one char, three UTF-8 bytes
+        assert_eq!(text_width("🚀"), 6);
+    }
+
+    #[test]
+    fn draw_text_non_ascii_uses_space_glyph_without_panic() {
+        let mut img = RgbImage::new(40, 20);
+        draw_text(&mut img, 0, 0, "aé🚀z", FaceRgb::WHITE);
+        // Chars are counted, not bytes: 'a' at cell 0, é/🚀 skipped at cells
+        // 1/2, 'z' at cell 3 (x = 3 * 6 = 18). 'a' col0 = 0x20 has bit 5 set
+        // (row 5); 'z' col0 = 0x44 has bits 2 and 6 (rows 2 and 6).
+        assert_eq!(img.get_pixel(0, 5).0, [255, 255, 255], "'a' paints bit 5");
+        assert_eq!(img.get_pixel(18, 2).0, [255, 255, 255], "'z' paints bit 2");
+        assert_eq!(img.get_pixel(18, 6).0, [255, 255, 255], "'z' paints bit 6");
+        // The é/🚀 cells fall back to the space glyph: nothing painted.
+        assert_eq!(img.get_pixel(6, 3).0, [0, 0, 0], "é cell is empty");
+        assert_eq!(img.get_pixel(12, 3).0, [0, 0, 0], "🚀 cell is empty");
     }
 }

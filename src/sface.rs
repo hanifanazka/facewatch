@@ -2,7 +2,7 @@
 //! L2-normalized embedding. Preprocessing mirrors OpenCV's
 //! FaceRecognizerSF: BGR channel order, normalized (pixel - 127.5) / 127.5.
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use ndarray::{Array4, IxDyn};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -75,5 +75,80 @@ impl SFace {
         }
 
         Ok(Embedding(values))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::Models;
+
+    #[test]
+    fn input_size_is_square_112() {
+        assert_eq!(INPUT_SIZE, 112);
+    }
+
+    #[test]
+    fn load_rejects_garbage_bytes() {
+        assert!(SFace::load(b"this is not an onnx model", 1).is_err());
+        assert!(SFace::load(b"", 1).is_err());
+    }
+
+    #[test]
+    fn real_model_embeds_are_128d_l2_normalized_and_deterministic() {
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sface = SFace::load(Models::embedded().sface, 1).expect("model loads");
+
+        let crop = Array3U8::from_shape_fn((INPUT_SIZE, INPUT_SIZE, 3), |(y, x, _)| {
+            ((y * 31 + x * 7) % 256) as u8
+        });
+        let a = sface.embed(&crop).expect("embed blank crop");
+        assert_eq!(a.0.len(), 128);
+
+        let norm: f32 = a.0.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "L2-normalized, got norm {norm}");
+
+        let b = sface.embed(&crop).expect("embed again");
+        let cos: f32 = a.0.iter().zip(&b.0).map(|(x, y)| x * y).sum();
+        assert!(cos > 0.9999, "deterministic embedding, cosine {cos}");
+    }
+
+    #[test]
+    fn real_model_channel_order_matters() {
+        // SFace expects BGR; feeding the same pixels with R/B swapped must
+        // produce a clearly different embedding. The crop is a smooth
+        // vertical ramp with distinct per-channel offsets — low-frequency and
+        // chromatic, so the swap is not a no-op (flat colored fields already
+        // differ strongly: e.g. red vs blue cosine ~0.77 in probes).
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sface = SFace::load(Models::embedded().sface, 1).expect("model loads");
+
+        let crop = Array3U8::from_shape_fn((INPUT_SIZE, INPUT_SIZE, 3), |(y, _, c)| {
+            ((y * 2 + c * 40) % 256) as u8
+        });
+        let mut swapped = crop.clone();
+        for y in 0..INPUT_SIZE {
+            for x in 0..INPUT_SIZE {
+                swapped[[y, x, 0]] = crop[[y, x, 2]];
+                swapped[[y, x, 2]] = crop[[y, x, 0]];
+            }
+        }
+        let a = sface.embed(&crop).expect("canonical BGR input");
+        let b = sface.embed(&swapped).expect("channel-swapped input");
+        let cos: f32 = a.0.iter().zip(&b.0).map(|(x, y)| x * y).sum();
+        assert!(cos < 0.99, "BGR vs RGB must differ, cosine {cos}");
+        // Sanity: identical inputs still give identical embeddings (0.9999+).
+        let again = sface.embed(&crop).expect("embed again");
+        let cos2: f32 = a.0.iter().zip(&again.0).map(|(x, y)| x * y).sum();
+        assert!(cos2 > 0.9999, "identical input is deterministic, cosine {cos2}");
+    }
+
+    #[test]
+    fn real_model_rejects_off_shape_crop() {
+        let _g = crate::face::MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sface = SFace::load(Models::embedded().sface, 1).expect("model loads");
+        let crop = Array3U8::zeros((112, 112, 2));
+        let err = sface.embed(&crop).unwrap_err();
+        assert!(err.to_string().contains("112x112x3"), "{err}");
     }
 }

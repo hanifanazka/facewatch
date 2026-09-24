@@ -138,12 +138,7 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    anyhow::ensure!(
-        matches!(cli.input_size, 320 | 640),
-        "--input-size must be 320 or 640, got {}",
-        cli.input_size
-    );
+    validate_input_size(cli.input_size)?;
     let threads = model_threads(&cli);
 
     // Graceful ^C handling: the loop breaks as if it hit its natural end.
@@ -192,6 +187,15 @@ fn model_threads(cli: &Cli) -> usize {
             .map(|n| n.get())
             .unwrap_or(2)
     })
+}
+
+/// Rejects detector input sizes the embedded/pipeline supports (320 or 640).
+fn validate_input_size(input_size: usize) -> Result<()> {
+    anyhow::ensure!(
+        matches!(input_size, 320 | 640),
+        "--input-size must be 320 or 640, got {input_size}"
+    );
+    Ok(())
 }
 
 /// Loads an image file as an RGB `Array3<u8>` frame.
@@ -478,5 +482,220 @@ fn overlay_opts(cli: &Cli) -> OverlayOptions {
         save_dir: cli.save_dir.clone(),
         save_every: cli.save_every,
         verbose: cli.verbose,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::sync::Mutex;
+
+    // Tests that mutate process-global state (HOME, or the profile flag) must
+    // not race with each other or with the app's other tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn run_cli(args: &[&str]) -> Cli {
+        let mut argv = vec!["facewatch"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("CLI parses")
+    }
+
+    #[test]
+    fn cli_config_is_debug_assertable() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_parses_defaults() {
+        let cli = run_cli(&["run"]);
+        assert_eq!(cli.threshold, 0.40);
+        assert_eq!(cli.detector, "yunet");
+        assert_eq!(cli.recognizer, "auraface");
+        assert_eq!(cli.input_size, crate::face::DEFAULT_DETECT_SIZE);
+        assert_eq!(cli.save_every, 1);
+        assert_eq!(cli.rtsp, "rtsp://127.0.0.1:8554/facewatch");
+        assert!(!cli.no_rtsp);
+        assert!(!cli.verbose);
+        assert!(!cli.profile);
+        assert!(matches!(cli.command, Command::Run { frames: None, source: None }));
+    }
+
+    #[test]
+    fn cli_parses_global_flags_and_run_options() {
+        let cli = run_cli(&[
+            "--threshold",
+            "0.7",
+            "--detector",
+            "scrfd",
+            "--recognizer",
+            "sface",
+            "--threads",
+            "4",
+            "--input-size",
+            "320",
+            "--gallery",
+            "/tmp/g.json",
+            "--no-rtsp",
+            "--save-dir",
+            "/tmp/saved",
+            "--save-every",
+            "5",
+            "--verbose",
+            "--profile",
+            "run",
+            "--frames",
+            "10",
+            "--source",
+            "image:/tmp/photo.jpg",
+        ]);
+        assert_eq!(cli.threshold, 0.7);
+        assert_eq!(cli.detector, "scrfd");
+        assert_eq!(cli.recognizer, "sface");
+        assert_eq!(cli.threads, Some(4));
+        assert_eq!(cli.input_size, 320);
+        assert_eq!(cli.gallery, Some(PathBuf::from("/tmp/g.json")));
+        assert!(cli.no_rtsp);
+        assert_eq!(cli.save_dir, Some(PathBuf::from("/tmp/saved")));
+        assert_eq!(cli.save_every, 5);
+        assert!(cli.verbose);
+        assert!(cli.profile);
+        match cli.command {
+            Command::Run { frames, source } => {
+                assert_eq!(frames, Some(10));
+                assert_eq!(source.as_deref(), Some("image:/tmp/photo.jpg"));
+            }
+            _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_register_and_image_subcommands() {
+        match run_cli(&["register", "bob", "photo.jpg"]).command {
+            Command::Register { name, image } => {
+                assert_eq!(name, "bob");
+                assert_eq!(image, Some(PathBuf::from("photo.jpg")));
+            }
+            _ => panic!("expected Register"),
+        }
+        match run_cli(&["register", "bob"]).command {
+            Command::Register { image, .. } => assert!(image.is_none()),
+            _ => panic!("expected Register"),
+        }
+        match run_cli(&["image", "x.png"]).command {
+            Command::Image { path } => assert_eq!(path, PathBuf::from("x.png")),
+            _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn validate_input_size_accepts_supported_sizes() {
+        validate_input_size(320).unwrap();
+        validate_input_size(640).unwrap();
+        let err = validate_input_size(512).unwrap_err();
+        assert!(err.to_string().contains("--input-size must be 320 or 640"), "{err}");
+    }
+
+    #[test]
+    fn to_uri_passes_through_uris_and_builds_file_uris() {
+        assert_eq!(to_uri("rtsp://127.0.0.1:8554/cam"), "rtsp://127.0.0.1:8554/cam");
+        assert_eq!(to_uri("file:///abs/v.mp4"), "file:///abs/v.mp4");
+        assert_eq!(to_uri("/abs/path.mp4"), "file:///abs/path.mp4");
+        let expected = format!("file://{}", std::env::current_dir().unwrap().join("rel.mp4").display());
+        assert_eq!(to_uri("rel.mp4"), expected);
+    }
+
+    #[test]
+    fn default_gallery_uses_home_dot_facewatch() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/home/facewatch-tester") };
+        let p = default_gallery();
+        assert_eq!(p, PathBuf::from("/home/facewatch-tester/.facewatch/gallery.json"));
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn default_gallery_falls_back_to_cwd_when_home_unset() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        let p = default_gallery();
+        assert_eq!(p, PathBuf::from(".").join(".facewatch").join("gallery.json"));
+        match old {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => {}
+        }
+    }
+
+    #[test]
+    fn model_threads_uses_explicit_or_available_parallelism() {
+        let with_threads = run_cli(&["--threads", "3", "run"]);
+        assert_eq!(model_threads(&with_threads), 3);
+        let default = run_cli(&["run"]);
+        let expected = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        assert_eq!(model_threads(&default), expected);
+    }
+
+    #[test]
+    fn load_image_frame_roundtrips_a_png() {
+        let img = image::RgbImage::from_fn(2, 2, |x, y| {
+            if x == 0 && y == 0 {
+                image::Rgb([255u8, 0, 0])
+            } else {
+                image::Rgb([0u8, 0, 0])
+            }
+        });
+        let path = std::env::temp_dir().join(format!("facewatch-frame-{}.png", std::process::id()));
+        img.save(&path).expect("saves a png");
+        let frame = load_image_frame(&path).expect("loads the png");
+        assert_eq!(frame.shape(), &[2, 2, 3]);
+        assert_eq!(frame[[0, 0, 0]], 255);
+        assert_eq!(frame[[0, 0, 1]], 0);
+        assert_eq!(frame[[0, 0, 2]], 0);
+        assert_eq!(frame[[1, 1, 0]], 0);
+        std::fs::remove_file(&path).ok();
+
+        let err = load_image_frame(&PathBuf::from("/nonexistent/facewatch-missing.png"))
+            .unwrap_err();
+        assert!(err.to_string().contains("failed to open image"), "{err}");
+    }
+
+    #[test]
+    fn overlay_opts_copies_cli_fields() {
+        let cli = run_cli(&["--save-dir", "/tmp/out", "--save-every", "3", "--verbose", "run"]);
+        let opts = overlay_opts(&cli);
+        assert_eq!(opts.save_dir, Some(PathBuf::from("/tmp/out")));
+        assert_eq!(opts.save_every, 3);
+        assert!(opts.verbose);
+    }
+
+    #[test]
+    fn register_rejects_empty_names_before_loading_models() {
+        // The empty-name guard runs before any model load, so a dummy Models
+        // is enough to exercise it.
+        let models = Models {
+            scrfd: &[],
+            yunet: &[],
+            auraface: &[],
+            sface: &[],
+        };
+        let gallery_path = std::env::temp_dir().join(format!("facewatch-gal-{}.json", std::process::id()));
+        let gallery = Arc::new(Mutex::new(Gallery::default()));
+        let err = register(
+            "   ",
+            None,
+            &models,
+            &gallery_path,
+            &gallery,
+            None,
+            1,
+            640,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "{err}");
     }
 }

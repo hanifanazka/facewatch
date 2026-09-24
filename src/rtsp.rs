@@ -46,7 +46,16 @@ impl RtspPublisher {
     /// (for example `rtsp://127.0.0.1:8554/facewatch`) and a `width` x
     /// `height` RGB stream. The pipeline is not started until [`start`]
     /// (Self::start) is called.
+    ///
+    /// The URL is interpolated into the GStreamer pipeline string inside
+    /// quotes, so it is validated up front: a double-quote or whitespace would
+    /// corrupt the graph syntax (and could inject extra pipeline elements).
     pub fn new(url: &str, width: u32, height: u32) -> Result<Self> {
+        anyhow::ensure!(
+            !url.contains('"') && !url.chars().any(char::is_whitespace),
+            "invalid RTSP url (must be a single token without quotes or spaces): {url:?}"
+        );
+
         gst::init().context("failed to initialize GStreamer")?;
 
         let pipeline_desc = format!(
@@ -172,5 +181,32 @@ impl RtspPublisher {
 impl Drop for RtspPublisher {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_frame_before_start_is_a_noop() {
+        // Building the pipeline only parses the graph; nothing connects, so no
+        // RTSP server is needed here. push_frame is documented as a no-op
+        // until start() is called.
+        let mut p =
+            RtspPublisher::new("rtsp://127.0.0.1:8554/facewatch", 8, 8).expect("pipeline builds");
+        let frame = Array3U8::zeros((8, 8, 3));
+        p.push_frame(&frame).expect("no-op before start returns Ok");
+        // Drop stops the never-started pipeline cleanly.
+    }
+
+    #[test]
+    fn new_rejects_urls_that_would_break_the_pipeline() {
+        // The URL is interpolated into `location="{url}"`; a double-quote or
+        // whitespace would corrupt the graph (and could inject elements), so
+        // RtspPublisher::new rejects them before even touching GStreamer —
+        // no server, plugins, or network required.
+        assert!(RtspPublisher::new("rtsp://127.0.0.1:8554/a\"b", 8, 8).is_err());
+        assert!(RtspPublisher::new("rtsp://127.0.0.1:8554/has space", 8, 8).is_err());
     }
 }
